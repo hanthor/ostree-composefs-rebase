@@ -325,14 +325,32 @@ fn list_count_placeholder(val: usize) -> usize {
 }
 
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
-    fs::create_dir_all(&dst)?;
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+    fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dst.join(file_name);
         let ty = entry.file_type()?;
+        
         if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            copy_dir_all(&path, &dest_path)?;
+        } else if ty.is_symlink() {
+            if dest_path.exists() || dest_path.is_symlink() {
+                let _ = fs::remove_file(&dest_path);
+            }
+            let link_target = fs::read_link(&path)?;
+            std::os::unix::fs::symlink(link_target, &dest_path)?;
+        } else if ty.is_file() {
+            if dest_path.exists() || dest_path.is_symlink() {
+                let _ = fs::remove_file(&dest_path);
+            }
+            fs::copy(&path, &dest_path)?;
         } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+            // Skip sockets, pipes, devices, etc. to avoid errors
+            eprintln!("Warning: skipping special file at {:?}", path);
         }
     }
     Ok(())
