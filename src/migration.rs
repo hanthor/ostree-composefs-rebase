@@ -35,6 +35,11 @@ pub fn mount_image(image_id: &str, mount_path: &Path) -> Result<()> {
 }
 
 pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()> {
+    println!("Remounting /sysroot read-write...");
+    let _ = Command::new("mount")
+        .args(["-o", "remount,rw", "/sysroot"])
+        .status();
+
     println!("=== Phase 1: Importing OSTree objects ===");
     let ostree_repo = "/sysroot/ostree/repo";
     if Path::new(ostree_repo).exists() {
