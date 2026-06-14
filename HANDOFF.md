@@ -27,7 +27,7 @@ All phases complete without errors:
 
 | Blocker | Resolution | SHA |
 |---------|------------|-----|
-| Phase 5 silently writes ESP BLS entries with no systemd-boot binary on ESP → VM falls back to OSTree | Preflight now exports `systemd_boot_binaries_present`; phase 5 routes to GRUB2 when `/usr/lib/systemd/boot/efi` is absent and errors loudly if `bootctl install` returns non-zero | _pending commit_ |
+| Phase 5 silently writes ESP BLS entries with no systemd-boot binary on ESP → VM falls back to OSTree | Preflight now exports `systemd_boot_binaries_present`; phase 5 routes to GRUB2 when `/usr/lib/systemd/boot/efi` is absent and errors loudly if `bootctl install` returns non-zero | a4b231a |
 
 ## Current Blocker: verify composefs entry actually boots via GRUB2
 
