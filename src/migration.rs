@@ -143,7 +143,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
 
     // Write .imginfo file
     println!("Writing .imginfo file...");
-    if let Ok(config_json) = inspect_image(&manifest_digest) {
+    if let Ok(config_json) = inspect_image(&config_digest) {
         let imginfo_path = deploy_dir.join(format!("{}.imginfo", sha512_verity));
         let _ = fs::write(&imginfo_path, config_json);
     }
@@ -158,7 +158,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     fs::create_dir_all(&temp_mount)?;
     
     println!("Mounting ComposeFS image to extract boot artifacts...");
-    mount_image(&manifest_digest, &temp_mount).context("failed to mount composefs image")?;
+    mount_image(&config_digest, &temp_mount).context("failed to mount composefs image")?;
     
     let result = (|| -> Result<()> {
         // Find kernel version from mounted image /usr/lib/modules
