@@ -253,6 +253,25 @@ fi
 echo "=== Copying migration utility to VM ==="
 scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/var/tmp/bootc-migrate-composefs
 
+echo "=== Injecting /etc fixtures (live, copied by migration) ==="
+ssh $SSH_OPTS root@localhost bash <<'ETCFIX'
+set -e
+# Custom config file in /etc to verify /etc state is preserved through migration
+mkdir -p /etc/migration-test
+echo "etc-state-value" > /etc/migration-test/marker.conf
+echo "nested-etc-value" > /etc/migration-test/nested.conf
+# Modify an existing /etc file to verify in-place edits are preserved
+echo "# e2e migration marker" >> /etc/hostname
+# A symlink in /etc to verify symlink handling
+ln -sf marker.conf /etc/migration-test/marker.link
+
+# Real user account so /home/<user> -> /var/home/<user> path resolution is tested
+useradd -m -U realuser 2>/dev/null || true
+mkdir -p /var/home/realuser
+echo "real-home-data" > /var/home/realuser/home-marker.txt
+chown -R realuser:realuser /var/home/realuser
+ETCFIX
+
 echo "=== Running migration inside VM ==="
 ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs --target-image $TARGET_IMAGE --force"
 
@@ -393,5 +412,52 @@ if [ "$HIDDEN" != "hidden-file-content" ]; then
     exit 1
 fi
 echo "OK: Hidden directory data preserved."
+
+# /etc state preserved through migration
+ETC_MARKER=$(ssh $SSH_OPTS root@localhost "cat /etc/migration-test/marker.conf 2>/dev/null || echo MISSING")
+if [ "$ETC_MARKER" != "etc-state-value" ]; then
+    echo "FAIL: /etc custom config was not preserved! (Found: $ETC_MARKER)"
+    exit 1
+fi
+echo "OK: /etc custom config preserved."
+
+ETC_NESTED=$(ssh $SSH_OPTS root@localhost "cat /etc/migration-test/nested.conf 2>/dev/null || echo MISSING")
+if [ "$ETC_NESTED" != "nested-etc-value" ]; then
+    echo "FAIL: Nested /etc file was not preserved! (Found: $ETC_NESTED)"
+    exit 1
+fi
+echo "OK: Nested /etc files preserved."
+
+# In-place edit of pre-existing /etc file
+HOSTNAME_TAIL=$(ssh $SSH_OPTS root@localhost "tail -n1 /etc/hostname")
+if [ "$HOSTNAME_TAIL" != "# e2e migration marker" ]; then
+    echo "FAIL: Edit to existing /etc file was not preserved! (Tail: $HOSTNAME_TAIL)"
+    exit 1
+fi
+echo "OK: In-place /etc edits preserved."
+
+# Symlink within /etc
+ETC_LINK=$(ssh $SSH_OPTS root@localhost "readlink /etc/migration-test/marker.link")
+if [ "$ETC_LINK" != "marker.conf" ]; then
+    echo "FAIL: /etc symlink was not preserved! (Found: $ETC_LINK)"
+    exit 1
+fi
+echo "OK: /etc symlinks preserved."
+
+# /home resolution (symlink to /var/home on bootc/ostree systems)
+HOME_DATA=$(ssh $SSH_OPTS root@localhost "cat /home/realuser/home-marker.txt 2>/dev/null || echo MISSING")
+if [ "$HOME_DATA" != "real-home-data" ]; then
+    echo "FAIL: /home/<user> data was not accessible after migration! (Found: $HOME_DATA)"
+    exit 1
+fi
+echo "OK: /home/<user> resolves and content preserved."
+
+# Real user account still exists
+REALUSER_ENT=$(ssh $SSH_OPTS root@localhost "getent passwd realuser || echo MISSING")
+if [ "$REALUSER_ENT" = "MISSING" ]; then
+    echo "FAIL: realuser account missing from passwd (added via /etc/passwd edit pre-migration)"
+    exit 1
+fi
+echo "OK: User account from /etc/passwd preserved: $REALUSER_ENT"
 
 echo "=== E2E TEST PASSED SUCCESSFULY ==="
