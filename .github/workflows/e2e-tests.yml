@@ -1,0 +1,38 @@
+name: E2E Migration Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  e2e-tests:
+    name: Run QEMU E2E Migration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf jq
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Binary
+        run: cargo build
+
+      - name: Run E2E Test Suite
+        env:
+          BASE_IMAGE: "quay.io/fedora/fedora-bootc:44"
+          TARGET_IMAGE: "quay.io/fedora/fedora-bootc:44" # For self-test in CI, pull same image to verify ComposeFS conversion works
+        run: |
+          # Run the test runner as root since loop mounts and podman --privileged are required
+          sudo -E ./tests/run-e2e.sh

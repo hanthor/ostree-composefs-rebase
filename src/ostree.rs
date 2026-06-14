@@ -1,0 +1,94 @@
+use std::fs;
+use std::io::{Read, BufReader};
+use std::path::{Path, PathBuf};
+use sha2::{Sha512, Digest};
+use anyhow::{Result, Context};
+
+pub fn compute_sha512<P: AsRef<Path>>(path: P) -> Result<String> {
+    let file = fs::File::open(&path)
+        .with_context(|| format!("failed to open file for hashing: {}", path.as_ref().display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha512::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let result = hasher.finalize();
+    Ok(format!("{:x}", result))
+}
+
+pub struct OstreeFileObject {
+    pub path: PathBuf,
+    pub ostree_checksum: String,
+}
+
+pub fn scan_ostree_file_objects<P: AsRef<Path>>(repo_path: P) -> Result<Vec<OstreeFileObject>> {
+    let objects_dir = repo_path.as_ref().join("objects");
+    let mut file_objects = Vec::new();
+
+    if !objects_dir.exists() {
+        return Ok(file_objects);
+    }
+
+    // Walk objects/xx/ directories
+    for entry in fs::read_dir(&objects_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Check if directory name is a 2-char hex string
+            if dir_name.len() == 2 && dir_name.chars().all(|c| c.is_ascii_hexdigit()) {
+                for file_entry in fs::read_dir(&path)? {
+                    let file_entry = file_entry?;
+                    let file_path = file_entry.path();
+                    if file_path.is_file() {
+                        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        // Check if it ends with .file
+                        if file_name.ends_with(".file") {
+                            let remaining_hex = &file_name[..file_name.len() - 5]; // remove ".file"
+                            let ostree_checksum = format!("{}{}", dir_name, remaining_hex);
+                            file_objects.push(OstreeFileObject {
+                                path: file_path,
+                                ostree_checksum,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(file_objects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_scan_ostree_objects() {
+        let dir = tempdir().unwrap();
+        let objects_dir = dir.path().join("objects");
+        let sub_dir = objects_dir.join("ab");
+        fs::create_dir_all(&sub_dir).unwrap();
+
+        let file_path = sub_dir.join("cdef1234.file");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"test file content").unwrap();
+        drop(file);
+
+        let list = scan_ostree_file_objects(dir.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].ostree_checksum, "abcdef1234");
+        assert_eq!(list[0].path, file_path);
+
+        let hash = compute_sha512(&file_path).unwrap();
+        assert_eq!(hash, "6543084c6981d2d3e44d295d20adee4e5fa3fc1bb2b7d3ac80ca456b0141dfd75657ba40ea5ae398824b3a871c8b7762c8bdbcbc252fa7f358d33d90ee455d86");
+    }
+}

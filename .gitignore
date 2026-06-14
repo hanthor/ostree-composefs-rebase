@@ -8,3 +8,9 @@ target/
 .idea/
 .vscode/
 *.swp
+
+# E2E test artifacts
+test_key
+test_key.pub
+disk.raw
+qemu.log

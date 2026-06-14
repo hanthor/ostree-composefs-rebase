@@ -159,7 +159,8 @@ options root=UUID=aaaa-bbbb rw ostree=/ostree/boot.1/fedora/abc123/0
 │   │   └── <sha512_verity>/        # Deployment ID = SHA-512 fsverity digest
 │   │       ├── etc/                # 3-way merged /etc (copy-on-deploy)
 │   │       ├── var -> ../../os/default/var  # Symlink to shared /var
-│   │       └── <sha512>.origin     # INI-format origin file
+│   │       ├── <sha512_verity>.origin     # INI-format origin file
+│   │       └── <sha512_verity>.imginfo    # OCI image config JSON (for status and labels)
 │   └── os/
 │       └── default/
 │           └── var/                # Shared persistent /var
@@ -213,17 +214,36 @@ The image is first pulled into bootc-owned containers-storage (so podman can use
 
 ### 3.3 Origin File Format (ComposeFS Backend)
 
-Example `<sha512>.origin`:
+Example `<sha512_verity>.origin`:
 ```ini
 [origin]
-ostree-unverified-image=docker://quay.io/fedora/fedora-bootc:41
+container-image-reference = ostree-unverified-image:docker://quay.io/fedora/fedora-bootc:41
 
 [boot]
 boot_type = bls
 digest = a1b2c3d4e5f6...
+```
 
-[image]
-manifest_digest = sha256:abc123def456...
+#### 3.3.1 Image Info File Format (ComposeFS Backend)
+
+Alongside the origin file, the deployment directory contains a `<sha512_verity>.imginfo` file. This contains the full OCI image configuration JSON, which is essential for `bootc status` to report the image digest, creation timestamp, architecture, and container labels.
+
+Example snippet from `<sha512_verity>.imginfo`:
+```json
+{
+  "config": {
+    "created": "2026-06-12T06:39:24Z",
+    "architecture": "amd64",
+    "os": "linux",
+    "config": {
+      "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+      "Labels": {
+        "containers.bootc": "1",
+        "ostree.bootable": "1"
+      }
+    }
+  }
+}
 ```
 
 ### 3.4 Boot Chain (ComposeFS Backend)
@@ -340,9 +360,12 @@ The "boot checksum" is a SHA-256 hash of (vmlinuz + initrd + devicetree) content
 
 #### ComposeFS Backend
 
-Kernel and initrd are discovered from `/usr/lib/modules/<kver>/` in the EROFS image. They are copied to a directory named `bootc_composefs-<sha512_verity>/` under `/boot` (Grub) or `EFI/Linux/` (systemd-boot).
+Kernel and initrd are discovered from `/usr/lib/modules/<kver>/` in the EROFS image. They are copied to a directory named `bootc_composefs-<hash>/` under `/boot` (Grub) or `EFI/Linux/` (systemd-boot).
 
-Multiple deployments sharing the same kernel+initrd will share the same boot binary directory (detected by SHA-256 of vmlinuz+initrd).
+Multiple deployments sharing the same kernel+initrd will share the same boot binary directory (detected by the SHA-256 `bootDigest` of the kernel+initrd).
+
+> [!NOTE]
+> **Directory Naming Note**: The directory `bootc_composefs-<hash>` on the ESP or `/boot` partition is named after the composefs verity digest of the *first* deployment that introduced that specific combination of kernel and initrd. If subsequent deployments share the same kernel and initrd, they will reuse this directory without renaming it, meaning the hash in the directory name will not necessarily match the composefs verity digest of the currently booted deployment.
 
 ---
 
@@ -479,6 +502,9 @@ The conversion process:
 4. Copy mutable state:
    cp -a /ostree/deploy/default/var /sysroot/state/os/default/var
    cp -a /etc (current merge) to /sysroot/state/deploy/<sha512>/etc
+   # Extract the OCI configuration JSON from the OSTree commit metadata of the current deployment
+   # (key: bootc.container-config or ostree.container-config) and write it to:
+   # /sysroot/state/deploy/<sha512>/<sha512>.imginfo
 
 5. Create deployment state:
    Write origin file referencing the same container image
@@ -493,9 +519,11 @@ The conversion process:
    Secondary: /boot/loader/entries/bootc_fedora-<ver>-0.conf
    (Secondary points to previous/rollback deployment)
 
-8. Clean up:
-   rm -rf /sysroot/ostree/deploy/
-   # Keep /sysroot/ostree/repo/ temporarily for rollback
+8. Clean up (post-boot confirmation only):
+   # DO NOT delete /sysroot/ostree/deploy/ during layout conversion.
+   # Retaining /sysroot/ostree/deploy/ is critical to support the dual-boot transition period.
+   # Once booted into ComposeFS and verified, a final cleanup command (e.g. bootc internals cleanup)
+   # can safely remove /sysroot/ostree/deploy/ and /sysroot/ostree/repo/ to reclaim space.
 ```
 
 #### Step 4: Dual-Boot Transition Period
@@ -571,6 +599,81 @@ Key source files for implementing migration:
 | `crates/lib/src/composefs_consts.rs` | All composefs path/name constants |
 | `crates/ostree-ext/src/` | OCI-to-ostree import/export |
 | `/tmp/composefs-rs-research/crates/composefs-oci/src/` | OCI image → composefs conversion |
+
+### 6.7 Bootloader Migration (GRUB2 → systemd-boot)
+
+A core requirement for migrating from `projectbluefin/bluefin` to `projectbluefin/dakota` is transitioning the system's bootloader from GRUB2 to `systemd-boot` in-place on a running system. This is a complex transition with significant pitfalls.
+
+#### 6.7.1 Detailed Preflight Verification
+Before modifying the boot configuration or EFI System Partition (ESP), the migration tool must execute the following validation checks:
+
+1. **ESP Size Validation**:
+   - **Constraint**: `systemd-boot` loads kernels, initramfs files, and Unified Kernel Images (UKIs) directly from the ESP (FAT32 partition). In contrast, GRUB2 loads them from the `/boot` partition (typically ext4/xfs).
+   - **Requirement**: The ESP must have enough space to store at least two versions of the kernel/initrd (active + fallback) for safety. For a typical `bootc` image, this requires at least **300MB of free space** on the ESP (ideally 500MB+ total ESP size).
+   - **Action**: Check free space on the ESP (mounted under `/boot/efi` or `/efi`). If the ESP has less than 300MB of free space, **abort the bootloader transition** and default to GRUB2 + ComposeFS BLS Type 1, which keeps kernel/initrd files on the `/boot` partition.
+
+2. **UEFI Boot Mode & NVRAM Access**:
+   - **Constraint**: `systemd-boot` requires a UEFI firmware environment and the ability to register UEFI boot variables.
+   - **Action**: Verify `/sys/firmware/efi/efivars` is populated and writable. If booted in Legacy BIOS mode (CSM) or if the NVRAM is read-only, abort the `systemd-boot` migration.
+
+3. **Secure Boot & Key Enrollment**:
+   - **Constraint**: Enabling Secure Boot requires the `systemd-boot` binary and the loaded UKI/kernel to be signed with keys trusted by the firmware (e.g., the Microsoft UEFI CA or enrolled Machine Owner Keys (MOK)).
+   - **Action**: Check Secure Boot status via `mokutil --sb-state` or efivars. If active, verify the target image provides signed binaries compatible with the system's firmware or that a local MOK signing infrastructure is available.
+
+#### 6.7.2 Step-by-Step Transition Workflow (Dual-Bootloader Staging)
+To prevent bricking the system in case of bootloader failure, the switch is staged using a dual-bootloader configuration:
+
+```mermaid
+graph TD
+    A[Booted in Bluefin: OSTree + GRUB2] --> B[Run Preflight Checks: ESP size, UEFI, Secure Boot]
+    B -- Valid --> C[Install systemd-boot to ESP in non-default slot]
+    B -- Invalid --> C1[Abort bootloader switch / Boot via GRUB2 + ComposeFS BLS Type 1]
+    C --> D[Copy Dakota kernel + initrd/UKI to ESP]
+    D --> E[Write ComposeFS BLS entry to ESP loader/entries/]
+    E --> F[Retain old GRUB2 boot configs on /boot]
+    F --> G[Run efibootmgr to register systemd-boot as #1 boot target]
+    G --> H[Reboot System]
+    H --> I{Boots successfully via systemd-boot?}
+    I -- Yes --> J[Run bootc internals cleanup: remove old GRUB2 configurations & OSTree deployments]
+    I -- No --> K[User selects GRUB2 in UEFI boot menu -> boots back to rollback OSTree deployment]
+```
+
+1. **Stage systemd-boot Binaries**:
+   - Install `systemd-boot` to the ESP using `bootctl install --no-variables`. This copies `systemd-bootx64.efi` to the ESP without changing UEFI NVRAM boot order, leaving GRUB2 as the default for the moment.
+
+2. **Copy Boot Files to ESP**:
+   - Extract the kernel and initrd (or UKI) from the Dakota container image and copy them to the ESP:
+     - For BLS Type 1: `/EFI/Linux/bootc_composefs-<hash>/vmlinuz` and `initrd`.
+     - For UKI Type 2: `/EFI/Linux/boot/bootc_composefs-<hash>.efi`.
+
+3. **Create systemd-boot BLS Entry**:
+   - Write a new BLS entry to the systemd-boot loader entries directory on the ESP (e.g., `/boot/efi/loader/entries/bootc_bluefin_dakota-<ver>-1.conf`) pointing to the newly copied files.
+
+4. **Maintain GRUB2 Staging (Rollback Path)**:
+   - Do **NOT** modify or delete existing GRUB2 entries or files on the `/boot` partition.
+   - This ensures that if the system fails to boot via `systemd-boot`, the user can press the UEFI boot menu key (F12/F11) at startup and select the GRUB2 entry to boot the old working OSTree deployment.
+
+5. **Update UEFI NVRAM Boot Order**:
+   - Run `efibootmgr` to register systemd-boot as the primary boot choice (first option) and demote the GRUB2 bootloader to the secondary option.
+
+6. **Verify and Clean Up**:
+   - Reboot the system.
+   - Upon successful boot into Dakota via `systemd-boot`, verify that `bootc status` shows ComposeFS and systemd-boot.
+   - Run the final cleanup command which removes the old GRUB2 boot records and `/sysroot/ostree/` deployments to reclaim storage space.
+
+#### 6.7.3 Btrfs Subvolume Migration Details
+Since both Bluefin and Dakota use Btrfs as the default filesystem, subvolume structure must be carefully transitioned:
+
+1. **OSTree Subvolume Layout**:
+   - OSTree typically uses a subvolume (e.g., `root`) representing the deployment tree, and `/var` is either a subdirectory or a separate subvolume.
+2. **ComposeFS Subvolume Layout**:
+   - ComposeFS expects the physical root of the partition (subvolume ID 5, `/`) to be mounted under `/sysroot`.
+   - The active `/var` must reside at `/sysroot/state/os/default/var`.
+3. **Migration Steps**:
+   - If `/var` is a separate subvolume (e.g., `var` subvolume in Btrfs):
+     - Retain the subvolume. Update `/etc/fstab` (or systemd mount units) in the ComposeFS state directory (`/sysroot/state/deploy/<sha512>/etc/fstab`) to mount the existing `var` subvolume to `/var` (or `/sysroot/state/os/default/var`), preserving user home directories (symlinked under `/var/home`) and containers data.
+   - If `/var` is a subdirectory within the `root` subvolume:
+     - Move the contents of `/var` to `/sysroot/state/os/default/var` (instantaneous rename operation on Btrfs since it is on the same physical partition).
 
 ---
 
@@ -878,6 +981,48 @@ jobs:
 | **Grub → systemd-boot** | Bootloader change during migration | systemd-boot loads UKI or BLS entry |
 | **XFS vs btrfs** | Migration on different filesystems | FICLONE works on both, behaviour identical |
 
+### 7.7 Validation Test Case: Bluefin to Dakota Migration
+
+To validate the storage migration and bootloader switch under real-world conditions, a specific test case must be executed that targets the migration from a `projectbluefin/bluefin:stable` image to a `projectbluefin/dakota:stable` image.
+
+#### 7.7.1 Validation Starting State
+- **Image**: `ghcr.io/projectbluefin/bluefin:stable` (OSTree-bootc format).
+- **Bootloader**: GRUB2 + shim (Secure Boot active).
+- **Filesystem**: Btrfs with a dedicated subvolume layout:
+  - Top-level subvolume (subvolid=5, `/`) mounted as `/sysroot` (or read-only physical root).
+  - Subvolume `root` containing the active OSTree deployment.
+  - Subvolume `var` containing persistent user data and home directories (symlinked under `/var/home`).
+- **ESP size**: Statically configured to simulate old installations (test matrix must cover 100MB and 500MB sizes).
+
+#### 7.7.2 Validation Workflow Steps
+1. **Preflight Stage**:
+   - Run the preflight checks. Ensure the tool correctly identifies if the ESP has `< 300MB` of free space, and:
+     - On the `100MB` ESP VM: Verify the tool **aborts** the `systemd-boot` migration, keeps GRUB2, and boots Dakota using GRUB2 + ComposeFS BLS Type 1.
+     - On the `500MB` ESP VM: Verify the tool proceeds with the `systemd-boot` migration.
+   - Verify that Btrfs subvolumes are correctly discovered.
+
+2. **Migration Stage**:
+   - Execute `bootc internals migrate-to-composefs --target-image=ghcr.io/projectbluefin/dakota:stable`.
+   - Verify that all OSTree bare objects are successfully imported as ComposeFS SHA-512 objects. If reflinking is supported (Btrfs), verify that the disk block usage does **not** double (using `du --reflink` or filesystem queries).
+   - Verify that Btrfs subvolume layout is preserved:
+     - The existing `var` subvolume is updated in `/etc/fstab` to mount at `/sysroot/state/os/default/var`.
+     - The `/var/home` and `/home` contents are preserved intact.
+
+3. **Bootloader Setup Stage**:
+   - Install `systemd-boot` to ESP in staging mode (leaving GRUB2 default).
+   - Write systemd-boot configuration and Dakota BLS entries to `/loader/entries/`.
+   - Register systemd-boot in UEFI NVRAM via `efibootmgr` as the first boot target.
+
+4. **Reboot and First Boot Stage**:
+   - Trigger a reboot.
+   - Verify that systemd-boot starts successfully, reads the Dakota BLS entry, mounts the ComposeFS EROFS image as the root filesystem, and successfully bind-mounts the `var` subvolume.
+   - Verify that Secure Boot chain validation passes (meaning `systemd-boot` and the UKI/kernel are signed with keys trusted by the shim/OVMF firmware).
+
+5. **Rollback Staging Verification**:
+   - Manually trigger a boot failure (e.g. by passing invalid kernel arguments to systemd-boot or corrupting the Dakota EROFS image).
+   - Verify that the UEFI firmware automatically falls back to the GRUB2 boot option, or the user can select GRUB2 in the boot menu.
+   - Verify that GRUB2 successfully boots the rollback `projectbluefin/bluefin` OSTree deployment and mounts the original `/var` subvolume correctly.
+
 ---
 
 ## 8. Open Issues & Risks
@@ -888,9 +1033,11 @@ jobs:
 |------|----------|------------|
 | `/etc` merge may lose customizations if the 3-way merge algorithm behaves differently between ostree-finalize and composefs-finalize | High | Exhaustive comparison testing; verify /etc diff before and after |
 | Kernel+initrd compatibility (composefs requires EROFS + overlayfs kernel config) | High | Pre-flight check before migration |
-| Secure Boot chain: switching from shim+GRUB to systemd-boot+UKI breaks existing Secure Boot chain | Medium | Support dual-bootloader config; offer grub-only migration path |
-| Disk space during transition: need room for both ostree repo + composefs objects | Medium | Progressive cleanup: remove ostree objects as composefs objects are created |
-| SELinux labels: composefs objects store labels differently than ostree objects | Medium | SELinux-aware conversion utility |
+| Secure Boot chain: switching from shim+GRUB to systemd-boot+UKI breaks existing Secure Boot chain | High | Support dual-bootloader config; offer GRUB2-only migration path to prevent Secure Boot breakage on systems without systemd-boot support. |
+| Disk space exhaustion during copy: on filesystems without reflink (FICLONE) support (e.g. ext4), copying objects doubles storage usage | High | Verify reflink support and ensure free space is > 1.5x active deployment size before starting. |
+| Rollback destruction via premature cleanup: deleting `/sysroot/ostree/deploy/` during migration renders OSTree boot entries unbootable immediately | High | Retain OSTree deployment directories during the transition period; defer removal until post-boot verification is complete. |
+| SELinux Labeling: incorrect label application in the EROFS metadata image or on objects can lead to boot-time policy blocks and failures | High | Preserve and pass all security contexts (including `security.selinux` xattrs) from the OSTree repo to `mkcomposefs` / `composefs-rs`. |
+| GRUB2 path resolution failure: `grub2-mkconfig` fails to resolve the canonical path under composefs/overlay fs layouts | Medium | Ensure `grub2` and `bootupd` are upgraded to versions that include composefs path resolution fixes prior to migration. |
 | Grub BLS filename parsing: need to carefully format bootc BLS filenames for correct ordering | Low | Already handled in boot.rs (type1_entry_conf_file_name) |
 
 ### 8.2 Known Gaps (from bootc docs/issue tracker)
