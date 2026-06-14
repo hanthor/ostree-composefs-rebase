@@ -130,6 +130,8 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     println!("=== Phase 3: Creating ComposeFS EROFS Image ===");
     let sha512_verity = crate::composefs::create_image(&config_digest)
         .context("failed to create composefs image")?;
+    // Strip the sha512: prefix for cleaner directory/file names (GRUB doesn't handle colons well)
+    let verity_hash = sha512_verity.strip_prefix("sha512:").unwrap_or(&sha512_verity);
     println!("ComposeFS EROFS image created. Verity digest: {}", sha512_verity);
 
     // Seal the image so it can be mounted
@@ -139,7 +141,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     println!("Image sealed successfully.");
 
     println!("=== Phase 4: Staging Deployment State ===");
-    let deploy_dir = Path::new("/sysroot/state/deploy").join(&sha512_verity);
+    let deploy_dir = Path::new("/sysroot/state/deploy").join(verity_hash);
     fs::create_dir_all(&deploy_dir).context("failed to create deployment directory")?;
 
     // Create etc and var directories
@@ -182,10 +184,9 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     let _ = fs::remove_dir_all(&temp_mount);
     fs::create_dir_all(&temp_mount)?;
     
-    // The EROFS image is stored under the verity digest (sha512 hash) in /sysroot/composefs/images/
-    let image_path_id = sha512_verity.strip_prefix("sha512:").unwrap_or(&sha512_verity);
+    // The EROFS image is stored under the verity hash in /sysroot/composefs/images/
     println!("Mounting ComposeFS image to extract boot artifacts...");
-    mount_image(image_path_id, &temp_mount).context("failed to mount composefs image")?;
+    mount_image(verity_hash, &temp_mount).context("failed to mount composefs image")?;
     
     let result = (|| -> Result<()> {
         // Find kernel version from mounted image /usr/lib/modules
@@ -227,7 +228,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
             }
             
             // Create target boot directory on ESP
-            let boot_dir_name = format!("bootc_composefs-{}", sha512_verity);
+            let boot_dir_name = format!("bootc_composefs-{}", verity_hash);
             let esp_boot_dir = Path::new(esp).join("EFI/Linux").join(&boot_dir_name);
             fs::create_dir_all(&esp_boot_dir)?;
             
@@ -238,7 +239,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
             }
             
             // Write systemd-boot BLS entry
-            let entry_path = Path::new(esp).join("loader/entries").join(format!("bootc_bluefin_dakota-{}.conf", sha512_verity));
+            let entry_path = Path::new(esp).join("loader/entries").join(format!("bootc_bluefin_dakota-{}.conf", verity_hash));
             fs::create_dir_all(entry_path.parent().unwrap())?;
             
             let entry_content = format!(
@@ -259,7 +260,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
             }
         } else {
             println!("Staying on GRUB2 bootloader (BLS Type 1)...");
-            let boot_dir_name = format!("bootc_composefs-{}", sha512_verity);
+            let boot_dir_name = format!("bootc_composefs-{}", verity_hash);
             let grub_boot_dir = Path::new("/boot").join(&boot_dir_name);
             fs::create_dir_all(&grub_boot_dir)?;
             
@@ -268,7 +269,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
                 fs::copy(&initrd_src, grub_boot_dir.join("initrd"))?;
             }
             
-            let entry_path = Path::new("/boot/loader/entries").join(format!("bootc_bluefin_dakota-{}.conf", sha512_verity));
+            let entry_path = Path::new("/boot/loader/entries").join(format!("bootc_bluefin_dakota-{}.conf", verity_hash));
             let entry_content = format!(
                 "title Dakota\nversion {}\nlinux /{}/vmlinuz\ninitrd /{}/initrd\noptions {}\nsort-key bootc-bluefin-dakota-0\n",
                 kver, boot_dir_name, boot_dir_name, options_str
@@ -351,7 +352,7 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     }
 
     println!("\n=== MIGRATION COMPLETED ===");
-    println!("Staged ComposeFS deployment: {}", sha512_verity);
+    println!("Staged ComposeFS deployment: {}", verity_hash);
     if use_systemd_boot {
         println!("Primary bootloader updated to: systemd-boot");
     } else {
