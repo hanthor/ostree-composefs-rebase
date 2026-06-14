@@ -2,7 +2,7 @@
 
 **Repository:** `hanthor/ostree-composefs-rebase`  
 **Goal:** In-place migration from OSTree-booted Bluefin:stable to ComposeFS-booted Dakota:stable  
-**Date:** 2026-06-14  
+**Last updated:** 2026-06-14 (post grub-fix iteration)  
 
 ---
 
@@ -26,7 +26,7 @@ bootc-migrate-composefs (Rust CLI)
 | **2** | Pull target OCI image via `bootc internals cfs oci pull` | ✅ Working |
 | **3** | Create EROFS image via `bootc internals cfs oci create-image` + seal | ✅ Working |
 | **4** | Stage deployment: copy /etc, write .origin, .imginfo, var symlink | ✅ Working |
-| **5** | Mount EROFS, extract kernel/initrd, write bootloader entries | ⚠️ Artifacts correct, GRUB doesn't pick them up |
+| **5** | Mount EROFS, extract kernel/initrd, write bootloader entries | ✅ GRUB now selects the composefs entry; kernel boot fails downstream (see Current Blocker) |
 
 ## What Works
 
@@ -55,26 +55,53 @@ After migration completes, the following exist on disk:
 - **.origin file:** Points to target OCI image with composefs digest
 - **.imginfo file:** OCI config JSON for `bootc status`
 
-## Current Blocker: GRUB Doesn't Boot the ComposeFS Entry
+## Current Blocker: ComposeFS Kernel Boots but Doesn't Reach SSH
 
-**Symptom:** After reboot, `bootc status --json` shows `store: ostreeContainer` and `composefs: null` — the system boots back to the old OSTree deployment.
+**Symptom:** After reboot, GRUB correctly selects and starts the Dakota
+(composefs) entry — the boot menu transcript shows `*Dakota` highlighted
+and "Booting `Dakota'" printed — but the VM never becomes reachable via
+SSH and the watch-for-boot loop times out. Without a serial console on
+the composefs kernel cmdline we could not see what happened next.
 
-**What we've tried:**
-1. `grub2-mkconfig -o /boot/grub2/grub.cfg` — fails with `grub2-probe: error: failed to get canonical path of 'composefs'` (probe tries to resolve the `composefs=` kernel option as a device)
-2. `grub2-set-default <entry-id>` — doesn't change boot behavior
-3. Writing `saved_entry=<id>` directly to `/boot/grub2/grubenv` — no effect
-4. `sort-key bootc-bluefin-dakota-0` in BLS entry — doesn't take priority
+**Why we believe this is the actual point of failure:**
+- The previous-stage blocker (GRUB picking `ostree-1.conf` instead of our
+  entry) was conclusively fixed: grubenv now holds the correct
+  `saved_entry`, grub.cfg has `set default="${saved_entry}"`, and the
+  serial dump of the GRUB TUI shows `*Dakota` as the selected default.
+- The new failure happens after the kernel handoff: kernel/initrd are
+  read off `/boot/bootc_composefs-<hash>/`, but the system does not come
+  up — strongly suggests composefs-setup-root in initrd is failing, or
+  rootfs mounts but networking/sshd does not start.
 
-**Root cause hypothesis:** GRUB's `blscfg` module reads BLS entries from `/boot/loader/entries/` but may not be parsing our entry correctly, OR the existing OSTree entry has a higher priority sort-key.
+**In-flight diagnostic work (already pushed):**
+- `tests/run-e2e.sh` patches `console=ttyS0,115200n8 console=tty0` into
+  every BLS entry on the base disk *before first boot*. Since
+  `get_kernel_options()` in `migration.rs` inherits cmdline from
+  `/proc/cmdline`, the composefs entry written during migration will
+  also get the serial console — so the post-reboot boot is visible.
+- A `tail -F qemu.log` runs during both boot-waits and streams kernel
+  output into the CI log as `[vm-serial] …`.
 
-**Next steps to investigate:**
-- Dump the OSTree BLS entry (`ostree-1.conf`) to compare format/sort-key
-- Check if GRUB is in `savedefault` mode (`GRUB_DEFAULT=saved` in `/etc/default/grub`)
-- Try modifying the OSTree entry's sort-key to sort AFTER the composefs entry
-- Consider using `grub2-reboot` with the entry title instead of `grub2-set-default`
-- Verify the BLS entry content is valid by parsing with grubby or bootctl
+**Next steps once serial output lands:**
+- Inspect kernel/initrd output from the failing Dakota boot.
+- Likely candidates: composefs= argument format wrong (we currently
+  emit `composefs=sha512:<hash>`; initrd might expect the bare hex),
+  missing modules in the extracted initrd, or `/var` symlink not
+  resolving in early boot.
+- Confirm `bootc internals cleanup` is not needed pre-reboot to detach
+  the OSTree deployment before composefs takes over.
 
-## Previous Issues Resolved
+## Previously Solved (in this session)
+
+| Issue | Fix | Commit |
+|-------|-----|--------|
+| Raw `fs::write` to grubenv corrupting 1024-byte block | Use `grub2-editenv` (fall back to `grub2-set-default`); also set `GRUB_DEFAULT=saved` in `/etc/default/grub` | `6796b99` |
+| bootupd grub.cfg never consults `saved_entry` (no `set default=` line) so blscfg picked its own default | Inject `set default="${saved_entry}"` before the `blscfg` command, idempotently | `a82a043` |
+| No coverage that `/etc` state survives migration; `/home` symlink untested | Live-inject `/etc/migration-test/*`, in-place edit `/etc/hostname`, /etc symlink, and a real `useradd realuser` + `/home/realuser` content check | `6938d37` |
+| No kernel-level visibility — qemu.log empty past GRUB | Patch BLS entries on disk to add `console=ttyS0,115200n8 console=tty0`; force `systemctl enable sshd` + direct multi-user symlink in derived image; stream qemu.log via tail -F with ANSI strip into CI log | `1a4c986` |
+| CI only ran fedora-bootc self-migration | Matrix the workflow over `fedora-bootc -> fedora-bootc` and `bluefin -> dakota` with `fail-fast: false` | `fafd0b9` |
+
+## Previously Solved (earlier sessions)
 
 | Issue | Fix | Commit |
 |-------|-----|--------|
@@ -94,27 +121,51 @@ After migration completes, the following exist on disk:
 
 ### CI (GitHub Actions)
 - **Workflow:** `.github/workflows/e2e-tests.yml`
-- **Base:** `quay.io/fedora/fedora-bootc:44` (OSTree)
-- **Target:** `quay.io/fedora/fedora-bootc:44` (ComposeFS, same image)
+- **Matrix** (`fail-fast: false`):
+  - `fedora-bootc -> fedora-bootc` — self-migration smoke test
+  - `bluefin:stable -> dakota:stable` — the real target scenario
 - **Runner:** `ubuntu-latest` with QEMU + KVM + OVMF
-- **Status:** Migration completes, artifacts verified, but post-reboot composefs detection fails
+- **Status:** fedora-bootc reaches the composefs entry post-reboot; the
+  Dakota kernel boots but SSH never comes up (current blocker). Bluefin
+  matrix leg still fails earlier — base image's sshd / kernel-console
+  fix is in place but unverified.
 
 ### Local (Bluefin → Dakota)
-- **Script:** `tests/run-e2e.sh`
-- **Base:** `ghcr.io/projectbluefin/bluefin:stable` with derived image (sshd enabled)
-- **Target:** `ghcr.io/projectbluefin/dakota:stable`
-- **Blocker:** Bluefin's kernel doesn't output to serial console AND sshd is disabled by default
-- **Fix attempted:** Build derived image FROM bluefin:stable with systemd preset for sshd + PermitRootLogin
-- **Status:** Derived image builds, GRUB boots, but no SSH — likely sshd still not starting or kernel console issue
+- **Script:** `tests/run-e2e.sh` — same script as CI, just invoked
+  directly via sudo. Use this to iterate without waiting for CI.
+- Status mirrors CI: Bluefin base image historically didn't boot to SSH;
+  visibility commit (`1a4c986`) should make any remaining issue
+  observable on next run.
 
 ### Test Fixtures (injected before migration, verified after)
-The test script creates these in /var and verifies post-migration:
+The test script creates these and verifies them post-migration:
 - `/var/lib/migration-test/data` — basic persistence
 - `/var/home/testuser/` — user home with dotfiles
 - `/var/home/devuser/` — nested project structure + SSH keys
 - `/var/lib/systemd/timers/` — system state
 - `/var/lib/alternatives/` — symlinks
 - `/var/cache/.hidden-dir/` — hidden directories
+- `/etc/migration-test/{marker,nested}.conf` — custom /etc state
+- `/etc/migration-test/marker.link` — symlink inside /etc
+- `/etc/hostname` (in-place append) — verifies edits to existing files
+- `realuser` (via `useradd`) + `/home/realuser/home-marker.txt` —
+  verifies `/home -> /var/home` symlink resolves and `/etc/passwd`
+  edits survive
+
+### Maintaining this file
+
+Keep `HANDOFF.md` current after each meaningful change. When fixing or
+discovering a blocker:
+
+1. Move the resolved item from "Current Blocker" into the appropriate
+   "Previously Solved" table with its short commit SHA.
+2. Replace the Current Blocker section with the *new* failing stage —
+   include the symptom, why we believe that's the actual point of
+   failure, what's already in-flight to diagnose it, and the next
+   candidate fixes.
+3. Bump the "Last updated" line.
+4. Don't grow the doc indefinitely; trim stale "next steps" once they
+   no longer apply.
 
 ## Key Design Decisions
 
