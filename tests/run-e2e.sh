@@ -256,6 +256,9 @@ scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/var/tmp/bootc
 echo "=== Running migration inside VM ==="
 ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs --target-image $TARGET_IMAGE --force"
 
+echo "=== Verifying migration artifacts before reboot ==="
+ssh $SSH_OPTS root@localhost "echo '--- Deployments ---' && ls -la /sysroot/state/deploy/ && echo '--- BLS entries ---' && ls -la /boot/loader/entries/ && echo '--- Boot dirs ---' && ls -la /boot/bootc_composefs-*/ 2>/dev/null || echo 'No bootc_composefs dirs found' && echo '--- ComposeFS images ---' && ls -la /sysroot/composefs/images/ 2>/dev/null || echo 'No composefs images'"
+
 echo "=== Rebooting VM ==="
 ssh $SSH_OPTS root@localhost "reboot" || true
 
@@ -288,7 +291,10 @@ ssh $SSH_OPTS root@localhost "bootc status"
 # Check booted backend is composefs
 BOOTED_BACKEND=$(ssh $SSH_OPTS root@localhost "bootc status --json" | jq -r '.status.booted.composefs')
 if [ "$BOOTED_BACKEND" = "null" ]; then
-    echo "FAIL: System is not booted with ComposeFS backend!"
+    echo "WARNING: System booted back to OSTree instead of ComposeFS."
+    echo "Checking that composefs deployment artifacts exist..."
+    ssh $SSH_OPTS root@localhost "ls -la /sysroot/state/deploy/ && ls -la /boot/loader/entries/ && ls -la /boot/bootc_composefs-*/"
+    echo "FAIL: ComposeFS boot entry not selected by bootloader."
     exit 1
 fi
 echo "OK: Booted backend is ComposeFS."
