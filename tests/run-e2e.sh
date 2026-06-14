@@ -134,6 +134,11 @@ echo "PermitRootLogin yes" | sudo tee -a "$SSHD_CONFIG_DIR/sshd_config" >/dev/nu
 sudo mkdir -p "$MNT_DIR/ostree/deploy/default/var/lib/migration-test"
 echo "persistent-test-data-value" | sudo tee "$MNT_DIR/ostree/deploy/default/var/lib/migration-test/data" >/dev/null
 
+# Create user home directory data to explicitly verify user home preservation
+sudo mkdir -p "$MNT_DIR/ostree/deploy/default/var/home/testuser"
+echo "hello-user-data-value" | sudo tee "$MNT_DIR/ostree/deploy/default/var/home/testuser/user-data.txt" >/dev/null
+sudo chmod -R 755 "$MNT_DIR/ostree/deploy/default/var/home/testuser"
+
 # Unmount loop device
 sudo umount "$MNT_DIR"
 sudo rmdir "$MNT_DIR"
@@ -169,6 +174,7 @@ echo "Waiting for VM to boot and SSH to become available on port $SSH_PORT..."
 MAX_ATTEMPTS=60
 ATTEMPT=1
 SSH_OPTS="-i ./test_key -p $SSH_PORT -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+SCP_OPTS="-i ./test_key -P $SSH_PORT -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
     if ssh $SSH_OPTS root@localhost true 2>/dev/null; then
@@ -188,7 +194,7 @@ fi
 
 # 8. Copy and run the migration utility
 echo "=== Copying migration utility to VM ==="
-scp $SSH_OPTS target/debug/ostree-composefs-rebase root@localhost:/usr/local/bin/bootc-migrate-composefs
+scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/usr/local/bin/bootc-migrate-composefs
 
 echo "=== Running migration inside VM ==="
 ssh $SSH_OPTS root@localhost "bootc-migrate-composefs --target-image $TARGET_IMAGE --force"
@@ -237,5 +243,13 @@ if [ "$TEST_DATA_VAL" != "persistent-test-data-value" ]; then
     exit 1
 fi
 echo "OK: Persistent /var data preserved."
+
+# Check user home preservation
+TEST_USER_DATA=$(ssh $SSH_OPTS root@localhost "cat /var/home/testuser/user-data.txt")
+if [ "$TEST_USER_DATA" != "hello-user-data-value" ]; then
+    echo "FAIL: User home directory data was not preserved! (Found: $TEST_USER_DATA)"
+    exit 1
+fi
+echo "OK: User home directory data preserved."
 
 echo "=== E2E TEST PASSED SUCCESSFULY ==="
