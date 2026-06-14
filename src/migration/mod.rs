@@ -669,7 +669,7 @@ fn phase5_setup_bootloader(
 
         match install_systemd_boot_from_target(esp_path, &mount_path, target_image) {
             Ok(()) => {
-                // Copy composefs kernel+initrd to ESP via podman (raw EROFS reads
+                // Copy composefs kernel+initrd to ESP via registry stream (raw EROFS reads
                 // return zero-filled content past the inline threshold).
                 let boot_dir_name = format!("bootc_composefs-{}", verity.as_hex());
                 let esp_boot_dir = esp_path.join("EFI/Linux").join(&boot_dir_name);
@@ -693,8 +693,8 @@ fn phase5_setup_bootloader(
                     esp_initrd = esp_boot_dir.join("initrd");
                     extract.push((in_container_initrd.as_path(), esp_initrd.as_path()));
                 }
-                extract_files_via_skopeo(target_image, &extract)
-                    .context("failed to extract kernel/initrd from target image via podman")?;
+                extract_files_via_registry(target_image, &extract)
+                    .context("failed to extract kernel/initrd from target image via registry stream")?;
 
                 // Build composefs BLS entry.
                 let composefs_entry = bootloader::BlsEntry {
@@ -888,43 +888,56 @@ fn phase5_setup_bootloader(
 /// `files` is a list of (in-container source path, on-host destination path) pairs.
 /// Destination parent directories must already exist. The OCI layers are scanned
 /// newest-first; the first hit wins (matches how the OCI image overlay would resolve).
-fn extract_files_via_skopeo(image_ref: &str, files: &[(&Path, &Path)]) -> Result<()> {
-    // /var/tmp lives on the real filesystem (unlike /tmp which is tmpfs on most
-    // bootc systems). The image blobs can be a few GB; we don't want them sitting in RAM.
-    let tmp = tempfile::Builder::new()
-        .prefix("bootc-migrate-extract-")
-        .tempdir_in("/var/tmp")
-        .context("failed to create /var/tmp scratch dir for skopeo extraction")?;
-    let oci_dir = tmp.path().join("oci");
+///
+/// We can't use `skopeo copy ... dir:` either: it downloads every compressed layer
+/// to disk before we can touch any of them, which ENOSPCs on the freshly-migrated
+/// btrfs (the EROFS image and composefs object store have already eaten most of /var).
+/// Instead we hit the registry HTTP API directly and stream one layer at a time,
+/// deleting it before moving on so peak disk use is bounded by the largest layer.
+fn extract_files_via_registry(image_ref: &str, files: &[(&Path, &Path)]) -> Result<()> {
+    let endpoint = RegistryEndpoint::resolve(image_ref)?;
+    let manifest_json = endpoint.fetch_manifest(&endpoint.reference)?;
 
-    // dir: writes raw blobs (manifest.json + every blob keyed by digest, no overlay).
-    let skopeo = Command::new("skopeo")
-        .args([
-            "copy",
-            "--src-tls-verify=false",
-            &format!("docker://{}", image_ref),
-            &format!("dir:{}", oci_dir.display()),
-        ])
-        .status()
-        .context("failed to invoke skopeo for boot-artifact extraction")?;
-    if !skopeo.success() {
-        return Err(anyhow!("skopeo copy {} failed", image_ref));
-    }
+    // Manifest list / OCI index → resolve to current-arch manifest.
+    let layers_manifest = if endpoint.is_manifest_index(&manifest_json) {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let entries = manifest_json
+            .get("manifests")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("manifest index has no manifests array"))?;
+        let pick = entries
+            .iter()
+            .find(|m| {
+                m.get("platform")
+                    .and_then(|p| p.get("architecture"))
+                    .and_then(|a| a.as_str())
+                    == Some(arch)
+            })
+            .ok_or_else(|| anyhow!("manifest index has no entry for arch {}", arch))?;
+        let digest = pick
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("manifest index entry has no digest"))?;
+        endpoint.fetch_manifest(digest)?
+    } else {
+        manifest_json
+    };
 
-    let manifest_str = fs::read_to_string(oci_dir.join("manifest.json"))
-        .context("failed to read skopeo manifest.json")?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(&manifest_str).context("failed to parse skopeo manifest.json")?;
-    let layers = manifest
+    let layers = layers_manifest
         .get("layers")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("skopeo manifest has no layers array"))?;
+        .ok_or_else(|| anyhow!("image manifest has no layers array"))?;
 
-    // Track remaining (src, dst) pairs. We mutate this as we satisfy entries.
+    let scratch = tempfile::Builder::new()
+        .prefix("bootc-migrate-extract-")
+        .tempdir_in("/var/tmp")
+        .context("failed to create /var/tmp scratch dir for layer streaming")?;
+
     let mut remaining: Vec<(&Path, &Path)> = files.iter().copied().collect();
-
-    // Walk layers newest (last in manifest) to oldest, since overlay semantics put
-    // upper layers first. systemd-boot binaries are typically near the top.
     for layer in layers.iter().rev() {
         if remaining.is_empty() {
             break;
@@ -933,21 +946,23 @@ fn extract_files_via_skopeo(image_ref: &str, files: &[(&Path, &Path)]) -> Result
             .get("digest")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("layer entry has no digest"))?;
-        let digest_hex = digest.trim_start_matches("sha256:");
-        let blob = oci_dir.join(digest_hex);
-        if !blob.exists() {
-            continue;
-        }
+
+        // Download just this one layer, extract from it, drop it.
+        let blob_path = scratch.path().join("layer.blob");
+        endpoint
+            .download_blob(digest, &blob_path)
+            .with_context(|| format!("failed to fetch layer {}", digest))?;
 
         let mut still_needed: Vec<(&Path, &Path)> = Vec::new();
         for (src, dst) in remaining.into_iter() {
-            if extract_one_from_layer(&blob, src, dst)? {
-                // Got it. Don't keep looking in older layers.
+            if extract_one_from_layer(&blob_path, src, dst)? {
+                // satisfied
             } else {
                 still_needed.push((src, dst));
             }
         }
         remaining = still_needed;
+        let _ = fs::remove_file(&blob_path);
     }
 
     if !remaining.is_empty() {
@@ -961,6 +976,264 @@ fn extract_files_via_skopeo(image_ref: &str, files: &[(&Path, &Path)]) -> Result
         ));
     }
     Ok(())
+}
+
+/// Resolved registry endpoint: base URL (scheme + host), repository, reference, and
+/// optional Bearer token. Built once per image and reused for the manifest + every
+/// blob fetch.
+struct RegistryEndpoint {
+    base_url: String,
+    repo: String,
+    reference: String,
+    bearer: Option<String>,
+}
+
+impl RegistryEndpoint {
+    fn resolve(image_ref: &str) -> Result<Self> {
+        let (host, repo, reference) = parse_image_ref(image_ref)?;
+
+        // Pick http for plain non-standard ports (local dev registries), https otherwise.
+        // We probe /v2/ to confirm and to discover any bearer challenge.
+        let candidates: &[&str] = if host_is_plain_http(&host) {
+            &["http"]
+        } else {
+            &["https", "http"]
+        };
+
+        for scheme in candidates {
+            let base = format!("{}://{}", scheme, host);
+            match probe_v2(&base, &repo) {
+                Ok(bearer) => {
+                    return Ok(RegistryEndpoint {
+                        base_url: base,
+                        repo,
+                        reference,
+                        bearer,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+        Err(anyhow!(
+            "could not reach registry {} (tried {:?})",
+            host,
+            candidates
+        ))
+    }
+
+    fn fetch_manifest(&self, reference: &str) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/v2/{}/manifests/{}",
+            self.base_url, self.repo, reference
+        );
+        let mut args: Vec<String> = vec![
+            "-sSL".into(),
+            "--fail".into(),
+            "-H".into(),
+            "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json".into(),
+        ];
+        if let Some(token) = &self.bearer {
+            args.push("-H".into());
+            args.push(format!("Authorization: Bearer {}", token));
+        }
+        args.push(url);
+        let out = Command::new("curl")
+            .args(&args)
+            .output()
+            .context("failed to invoke curl for manifest fetch")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "curl manifest fetch failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        serde_json::from_slice(&out.stdout).context("failed to parse manifest JSON")
+    }
+
+    fn is_manifest_index(&self, m: &serde_json::Value) -> bool {
+        match m.get("mediaType").and_then(|v| v.as_str()) {
+            Some(mt) => mt.contains("manifest.list") || mt.contains("image.index"),
+            None => m.get("manifests").is_some(),
+        }
+    }
+
+    fn download_blob(&self, digest: &str, dst: &Path) -> Result<()> {
+        let url = format!("{}/v2/{}/blobs/{}", self.base_url, self.repo, digest);
+        let mut args: Vec<String> = vec![
+            "-sSL".into(),
+            "--fail".into(),
+            "-o".into(),
+            dst.to_string_lossy().into_owned(),
+        ];
+        if let Some(token) = &self.bearer {
+            args.push("-H".into());
+            args.push(format!("Authorization: Bearer {}", token));
+        }
+        args.push(url);
+        let status = Command::new("curl")
+            .args(&args)
+            .status()
+            .context("failed to invoke curl for blob fetch")?;
+        if !status.success() {
+            return Err(anyhow!("curl blob fetch failed for {}", digest));
+        }
+        Ok(())
+    }
+}
+
+/// Hosts that should always use plain HTTP: bare IPv4 with a port, or `localhost`.
+fn host_is_plain_http(host: &str) -> bool {
+    if host.starts_with("localhost") {
+        return true;
+    }
+    // IPv4-with-port like 10.0.2.2:5000
+    let host_only = host.split(':').next().unwrap_or(host);
+    host_only
+        .split('.')
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && host_only.split('.').count() == 4
+}
+
+/// Probe `/v2/` (or `/v2/<repo>/tags/list`) to determine if the registry is reachable
+/// and whether it requires a Bearer token. Returns Ok(Some(token)) if a Bearer
+/// challenge was issued and we obtained a token, Ok(None) for anonymous access, Err
+/// on transport failure.
+fn probe_v2(base_url: &str, repo: &str) -> Result<Option<String>> {
+    let url = format!("{}/v2/", base_url);
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-D",
+            "-",
+            "--max-time",
+            "10",
+            &url,
+        ])
+        .output()
+        .context("curl probe failed")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "curl probe to {} failed: {}",
+            url,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let headers = String::from_utf8_lossy(&out.stdout);
+    // First line: HTTP/1.1 <code> ...
+    let status_code = headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("");
+    if status_code.starts_with("2") {
+        return Ok(None);
+    }
+    if status_code == "401" {
+        // Parse Www-Authenticate: Bearer realm="...",service="...",scope="..."
+        let challenge = headers
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("www-authenticate:"))
+            .ok_or_else(|| anyhow!("registry returned 401 with no Www-Authenticate header"))?;
+        let token = fetch_bearer_token(challenge, repo)?;
+        return Ok(Some(token));
+    }
+    Err(anyhow!(
+        "unexpected status from {}: {}",
+        url,
+        status_code
+    ))
+}
+
+/// Parse a `Www-Authenticate: Bearer realm="...",service="...",scope="..."` line and
+/// fetch an anonymous token. If the challenge didn't include a scope, build one for
+/// pull access to `repo`.
+fn fetch_bearer_token(challenge: &str, repo: &str) -> Result<String> {
+    let bearer_part = challenge
+        .splitn(2, ':')
+        .nth(1)
+        .map(|s| s.trim())
+        .unwrap_or("");
+    let bearer_part = bearer_part
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| anyhow!("Www-Authenticate is not a Bearer challenge: {}", challenge))?;
+
+    let mut realm: Option<String> = None;
+    let mut service: Option<String> = None;
+    let mut scope: Option<String> = None;
+    for kv in bearer_part.split(',') {
+        let mut it = kv.splitn(2, '=');
+        let k = it.next().unwrap_or("").trim();
+        let v = it.next().unwrap_or("").trim().trim_matches('"');
+        match k {
+            "realm" => realm = Some(v.to_string()),
+            "service" => service = Some(v.to_string()),
+            "scope" => scope = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    let realm = realm.ok_or_else(|| anyhow!("Bearer challenge missing realm"))?;
+    let scope = scope.unwrap_or_else(|| format!("repository:{}:pull", repo));
+
+    let mut url = format!("{}?scope={}", realm, urlencode(&scope));
+    if let Some(svc) = service {
+        url.push_str(&format!("&service={}", urlencode(&svc)));
+    }
+
+    let out = Command::new("curl")
+        .args(["-sSL", "--fail", &url])
+        .output()
+        .context("curl token fetch failed")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "token fetch failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .context("token endpoint did not return JSON")?;
+    let token = body
+        .get("token")
+        .or_else(|| body.get("access_token"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("token endpoint response has no token field"))?;
+    Ok(token.to_string())
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Parse `host[:port]/repo[:tag|@digest]` into (host, repo, reference).
+/// Reference is the digest if `@` was present, otherwise the tag (default `latest`).
+fn parse_image_ref(image_ref: &str) -> Result<(String, String, String)> {
+    let trimmed = image_ref
+        .strip_prefix("docker://")
+        .unwrap_or(image_ref)
+        .trim_start_matches('/');
+    let (host, rest) = trimmed
+        .split_once('/')
+        .ok_or_else(|| anyhow!("image ref {} has no repository component", image_ref))?;
+
+    // Split reference. `@` (digest) takes priority over `:` (tag) since digest contains `:`.
+    let (repo, reference) = if let Some((r, d)) = rest.split_once('@') {
+        (r.to_string(), d.to_string())
+    } else if let Some((r, t)) = rest.rsplit_once(':') {
+        (r.to_string(), t.to_string())
+    } else {
+        (rest.to_string(), "latest".to_string())
+    };
+    Ok((host.to_string(), repo, reference))
 }
 
 /// Try to extract a single file from one OCI layer blob to `dst`. Returns Ok(true)
@@ -1029,14 +1302,14 @@ fn install_systemd_boot_from_target(
     fs::create_dir_all(&removable_dir)?;
 
     let sd_dst = sd_dir.join("systemd-bootx64.efi");
-    extract_files_via_skopeo(
+    extract_files_via_registry(
         target_image,
         &[(
             Path::new("/usr/lib/systemd/boot/efi/systemd-bootx64.efi"),
             &sd_dst,
         )],
     )
-    .context("failed to extract systemd-bootx64.efi from target image via podman")?;
+    .context("failed to extract systemd-bootx64.efi from target image via registry stream")?;
 
     // Mirror to removable-media path. Local copy of the freshly-extracted (real) bytes
     // is safe — no EROFS in the read path.
