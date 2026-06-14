@@ -28,8 +28,8 @@ All phases complete without errors:
 | Blocker | Resolution | SHA |
 |---------|------------|-----|
 | Phase 5 silently writes ESP BLS entries with no systemd-boot binary on ESP → VM falls back to OSTree | Preflight `systemd_boot_binaries_present` field added; Phase 5 originally routed to GRUB2 when source binary absent | a4b231a |
-| GRUB2 fallback path set `next_entry` via `grub2-reboot` but bootupd's grub.cfg has no `if [ "${next_entry}" ]` block, so the one-shot was silently ignored | Phase 5 now writes `saved_entry` directly via `grub2-editenv` (with `grub2-set-default` as backup) instead of relying on grub2-reboot | _pending_ |
-| Required systemd-boot package on source (Bluefin) OS | Phase 5 now lifts `systemd-bootx64.efi` out of the mounted Dakota composefs image and copies it to `<ESP>/EFI/systemd/` + `<ESP>/EFI/BOOT/BOOTX64.EFI`; `efibootmgr --create` registers `Linux Boot Manager`; the source OS no longer needs systemd-boot | _pending_ |
+| GRUB2 fallback path set `next_entry` via `grub2-reboot` but bootupd's grub.cfg has no `if [ "${next_entry}" ]` block, so the one-shot was silently ignored | Phase 5 now writes `saved_entry` directly via `grub2-editenv` (with `grub2-set-default` as backup) instead of relying on grub2-reboot | e0b543f |
+| Required systemd-boot package on source (Bluefin) OS | Phase 5 now lifts `systemd-bootx64.efi` out of the mounted Dakota composefs image and copies it to `<ESP>/EFI/systemd/` + `<ESP>/EFI/BOOT/BOOTX64.EFI`; `efibootmgr --create` registers `Linux Boot Manager`; the source OS no longer needs systemd-boot | e0b543f |
 
 ## Current Blocker: verify end-to-end systemd-boot migration on Bluefin → Dakota
 
