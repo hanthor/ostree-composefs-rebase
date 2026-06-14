@@ -15,15 +15,50 @@ WORKSPACE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 step() { printf '\033[1;36m[e2e %s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 
+# CI-friendly serial-console filter. The raw QEMU log dumps thousands of systemd
+# `[ OK ] Started …` lines per boot — readable on a TTY, useless in CI. Only
+# forward lines that carry actual signal (failures, sshd/login activity, BLS
+# entries, kernel panics, our migration markers). The full unfiltered log
+# remains on disk at qemu.log for forensic inspection.
+vm_tail() {
+    local prefix="${1:-vm-serial}"
+    tail -F -q -n 0 qemu.log 2>/dev/null \
+      | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[()][0-9A-Za-z]//g' \
+      | grep --line-buffered -E '\[FAILED\]|Failed to start|panic|Out of memory|kernel BUG|Kernel panic|sshd|fedora login:|Welcome to|GRUB|Booting|systemd-boot|composefs|=== Phase|=== MIGRATION|bootc-migrate|Bluefin \(Version|Dakota|Linux Boot Manager' \
+      | awk -v p="$prefix" '{ print "[" p "] " $0; fflush() }'
+}
+
+# heartbeat: while $1 is a live PID, prints a "[e2e HH:MM:SS] still <label>
+# (Ns elapsed)" line every $2 seconds so CI doesn't think the job is hung.
+heartbeat() {
+    local pid="$1" interval="${2:-15}" label="${3:-working}"
+    local started=$SECONDS
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep "$interval"
+        kill -0 "$pid" 2>/dev/null || break
+        printf '\033[2;36m[e2e %s]\033[0m still %s (%ds elapsed)\n' \
+            "$(date +%H:%M:%S)" "$label" "$((SECONDS - started))"
+    done
+}
+
 # Kill any stray QEMU/tail processes from a previous interrupted run so this
 # invocation isn't competing for SSH_PORT or polluting qemu.log with stale tails.
+# Identify victims via pgrep into a variable so the kill command line doesn't
+# contain a pattern that would match (and SIGKILL) its own sudo wrapper.
 step "Reaping stray processes from prior runs..."
-sudo pkill -9 -f "qemu-system.*hostfwd=tcp::${SSH_PORT}-" 2>/dev/null || true
-PIDS=$(pgrep -f "tail -F.*qemu.log" || true)
-[ -n "$PIDS" ] && sudo kill -9 $PIDS 2>/dev/null || true
+{
+    qemu_pids=$(sudo ss -lntpH "sport = :${SSH_PORT}" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)
+    tail_pids=$(pgrep -f 'tail -F.* qemu.log$' || true)
+    reap_pids=$(printf '%s\n%s\n' "$qemu_pids" "$tail_pids" | grep -v '^$' | sort -u || true)
+    if [ -n "$reap_pids" ]; then
+        echo "Reaping PIDs: $reap_pids"
+        # shellcheck disable=SC2086
+        sudo kill -9 $reap_pids 2>/dev/null || true
+    fi
+} || true
 # Wait until the port is free so QEMU can bind it.
 for _ in $(seq 1 10); do
-    if ! sudo ss -lntp 2>/dev/null | grep -q ":${SSH_PORT} "; then break; fi
+    if ! sudo ss -lntH "sport = :${SSH_PORT}" 2>/dev/null | grep -q .; then break; fi
     sleep 1
 done
 
@@ -349,6 +384,18 @@ else
     echo "KVM not available. Falling back to emulation mode (TCG); CPU=max."
 fi
 
+# OVMF NVRAM persistence: without a writable VARS pflash, every QEMU boot starts
+# with an empty NVRAM, OVMF re-scans the ESP, and Fedora\shim wins over our
+# freshly-installed \EFI\systemd\systemd-bootx64.efi. That defeats the purpose
+# of `efibootmgr --create` because the new BootOrder never survives a reboot.
+# Initialise a 4 MB zeroed VARS file once per run — OVMF will populate it with
+# defaults on first boot and the migration's NVRAM changes will then persist.
+OVMF_VARS="$WORKSPACE_DIR/ovmf_vars.fd"
+if [ ! -f "$OVMF_VARS" ] || [ "$SKIP_SETUP" = false ]; then
+    rm -f "$OVMF_VARS"
+    truncate -s 4M "$OVMF_VARS"
+fi
+
 # Run QEMU in the background
 qemu-system-x86_64 \
     -m 4096 \
@@ -357,6 +404,7 @@ qemu-system-x86_64 \
     $KVM_FLAG \
     $CPU_FLAG \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_PATH" \
+    -drive if=pflash,format=raw,file="$OVMF_VARS" \
     -drive file=disk.raw,format=raw,if=virtio \
     -netdev user,id=n1,hostfwd=tcp::"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=n1 > qemu.log 2>&1 &
@@ -369,19 +417,21 @@ ATTEMPT=1
 SSH_OPTS="-i ./test_key -p $SSH_PORT -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 SCP_OPTS="-i ./test_key -P $SSH_PORT -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-# Stream qemu serial output in the background so we see boot progress in CI.
-# Strip ANSI sequences (GRUB draws a TUI) and prefix each line for clarity.
-( tail -F -q qemu.log 2>/dev/null \
-  | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[()][0-9A-Za-z]//g' \
-  | awk '{ print "[vm-serial] " $0; fflush() }' ) &
+# Stream high-signal qemu serial output to stdout (full log is on disk in qemu.log).
+vm_tail vm-serial &
 TAIL_PID=$!
 
+WAIT_START=$SECONDS
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
     if ssh $SSH_OPTS root@localhost true 2>/dev/null; then
-        echo "VM is accessible via SSH!"
+        step "VM accessible via SSH after $((SECONDS - WAIT_START))s."
         kill "$TAIL_PID" 2>/dev/null || true
         TAIL_PID=""
         break
+    fi
+    # Emit a heartbeat every 5 attempts (~15s) so CI sees forward progress.
+    if [ $((ATTEMPT % 5)) -eq 0 ]; then
+        step "still waiting for SSH ($((SECONDS - WAIT_START))s elapsed, attempt $ATTEMPT/$MAX_ATTEMPTS)"
     fi
     sleep 3
     ATTEMPT=$((ATTEMPT + 1))
@@ -431,7 +481,28 @@ ETCFIX
 step "=== Running migration inside VM ==="
 # Clean composefs state from previous runs so free-space check passes.
 ssh $SSH_OPTS root@localhost "rm -rf /sysroot/composefs /sysroot/state && mkdir -p /sysroot/composefs" 2>/dev/null || true
-ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs --target-image $VM_TARGET_IMAGE --force --skip-import"
+
+# Run the migration in the background so we can interleave a heartbeat. Pipe the
+# binary's output through a prefixer so its `=== Phase N ===` lines show up as
+# `[migrate]` in the CI log, distinct from script-level `[e2e …]` markers.
+MIGRATE_START=$SECONDS
+{
+    ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs --target-image $VM_TARGET_IMAGE --force --skip-import" 2>&1 \
+      | awk '{ print "[migrate] " $0; fflush() }'
+    echo "MIGRATE_RC=${PIPESTATUS[0]}" > /tmp/e2e-migrate.rc
+} &
+MIGRATE_BG=$!
+heartbeat "$MIGRATE_BG" 20 "migration in progress" &
+HB_PID=$!
+wait "$MIGRATE_BG"
+kill "$HB_PID" 2>/dev/null || true
+MIGRATE_RC=$(cat /tmp/e2e-migrate.rc 2>/dev/null | cut -d= -f2)
+rm -f /tmp/e2e-migrate.rc
+step "Migration completed in $((SECONDS - MIGRATE_START))s (rc=${MIGRATE_RC:-?})"
+if [ "${MIGRATE_RC:-1}" != "0" ]; then
+    echo "ERROR: migration binary exited with rc=${MIGRATE_RC:-?}" >&2
+    exit "${MIGRATE_RC:-1}"
+fi
 
 step "=== Verifying migration artifacts before reboot ==="
 ssh $SSH_OPTS root@localhost bash <<'DIAG'
@@ -446,8 +517,38 @@ for f in /boot/loader/entries/*.conf; do
     cat "$f"
     echo
 done
-echo '--- Boot dirs ---'
-ls -la /boot/bootc_composefs-*/ 2>/dev/null || echo 'No bootc_composefs dirs found'
+echo '--- Boot dirs (/boot, GRUB2 path) ---'
+ls -la /boot/bootc_composefs-*/ 2>/dev/null || echo 'No bootc_composefs dirs in /boot'
+echo '--- ESP loader entries (systemd-boot path) ---'
+for esp in /boot/efi /efi; do
+    if [ -d "$esp/loader/entries" ]; then
+        echo ">>> $esp/loader/entries/"
+        ls -la "$esp/loader/entries/" 2>/dev/null
+        for f in "$esp/loader/entries"/*.conf; do
+            [ -f "$f" ] || continue
+            echo ">>> $f"; cat "$f"; echo
+        done
+        echo ">>> $esp/loader/loader.conf"
+        cat "$esp/loader/loader.conf" 2>/dev/null || echo 'missing'
+        echo ">>> $esp/EFI/systemd/"
+        ls -la "$esp/EFI/systemd/" 2>/dev/null || echo 'missing'
+        echo ">>> $esp/EFI/BOOT/"
+        ls -la "$esp/EFI/BOOT/" 2>/dev/null || echo 'missing'
+    fi
+done
+# ESP may only mount transiently — try to mount partition labelled EFI-SYSTEM read-only for inspection.
+ESP_DEV=$(lsblk -ndo NAME,PARTLABEL 2>/dev/null | awk '$2=="EFI-SYSTEM" {print "/dev/"$1}' | head -1)
+if [ -n "$ESP_DEV" ] && ! mount | grep -q "$ESP_DEV"; then
+    mkdir -p /tmp/esp-inspect
+    if mount -o ro "$ESP_DEV" /tmp/esp-inspect 2>/dev/null; then
+        echo "--- ESP inspected at $ESP_DEV ---"
+        ls -la /tmp/esp-inspect/loader/entries/ 2>/dev/null
+        ls -la /tmp/esp-inspect/EFI/systemd/ 2>/dev/null
+        ls -la /tmp/esp-inspect/EFI/BOOT/ 2>/dev/null
+        cat /tmp/esp-inspect/loader/loader.conf 2>/dev/null
+        umount /tmp/esp-inspect 2>/dev/null
+    fi
+fi
 echo '--- ComposeFS images ---'
 ls -la /sysroot/composefs/images/ 2>/dev/null || echo 'No composefs images'
 echo '--- /etc/default/grub ---'
@@ -469,19 +570,20 @@ ssh $SSH_OPTS root@localhost "reboot" || true
 sleep 5
 
 # 9. Wait for VM to boot back
-echo "Waiting for VM to boot back after migration..."
-# Re-arm serial streaming so post-migration boot is visible too.
-( tail -F -q -n 0 qemu.log 2>/dev/null \
-  | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[()][0-9A-Za-z]//g' \
-  | awk '{ print "[vm-serial:post] " $0; fflush() }' ) &
+step "Waiting for VM to boot back after migration..."
+vm_tail vm-post &
 TAIL_PID=$!
 ATTEMPT=1
+WAIT_START=$SECONDS
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
     if ssh $SSH_OPTS root@localhost true 2>/dev/null; then
-        echo "VM is accessible via SSH after reboot!"
+        step "VM accessible via SSH after reboot ($((SECONDS - WAIT_START))s)."
         kill "$TAIL_PID" 2>/dev/null || true
         TAIL_PID=""
         break
+    fi
+    if [ $((ATTEMPT % 5)) -eq 0 ]; then
+        step "still waiting for post-reboot SSH ($((SECONDS - WAIT_START))s elapsed, attempt $ATTEMPT/$MAX_ATTEMPTS)"
     fi
     sleep 3
     ATTEMPT=$((ATTEMPT + 1))
