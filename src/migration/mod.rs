@@ -499,20 +499,24 @@ fn synthesize_var_fstab_entry(mounts: &str) -> Option<String> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         parts.len() >= 4 && parts[1] == "/var" && parts[2] == "btrfs"
     })?;
+    println!("[phase4] /proc/mounts /var line: {}", var_line);
+
     let parts: Vec<&str> = var_line.split_whitespace().collect();
     let device = parts[0];
     let raw_opts = parts[3];
 
-    let subvol_opt = raw_opts
+    let subvol_token = raw_opts
         .split(',')
-        .find(|o| o.starts_with("subvol=") && *o != "subvol=/")?;
+        .find(|o| o.starts_with("subvol=") && *o != "subvol=/")
+        .or_else(|| raw_opts.split(',').find(|o| o.starts_with("subvolid=")))
+        .unwrap_or("subvol=/");
 
     let uuid = resolve_device_uuid(device);
     let source = uuid
         .map(|u| format!("UUID={}", u))
         .unwrap_or_else(|| device.to_string());
 
-    let opts = format!("rw,relatime,{}", subvol_opt);
+    let opts = format!("rw,relatime,{}", subvol_token);
     Some(format!("{}\t/var\tbtrfs\t{}\t0 0\n", source, opts))
 }
 
