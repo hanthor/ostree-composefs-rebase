@@ -273,11 +273,17 @@ echo "Disk image initialized and customized."
 # 6. Launch QEMU VM
 echo "=== Booting VM under QEMU ==="
 KVM_FLAG=""
+CPU_FLAG="-cpu max"
 if [ -e /dev/kvm ]; then
     KVM_FLAG="-enable-kvm"
-    echo "KVM acceleration enabled."
+    # With KVM, expose host CPU features — the Rust binary is built on the
+    # host and assumes x86-64-v3 (AVX2 etc.), which the default qemu64 CPU
+    # does not provide and the guest aborts with "CPU ISA level is lower
+    # than required".
+    CPU_FLAG="-cpu host"
+    echo "KVM acceleration enabled; CPU=host."
 else
-    echo "KVM not available. Falling back to emulation mode (TCG)."
+    echo "KVM not available. Falling back to emulation mode (TCG); CPU=max."
 fi
 
 # Run QEMU in the background
@@ -286,6 +292,7 @@ qemu-system-x86_64 \
     -smp 2 \
     -nographic \
     $KVM_FLAG \
+    $CPU_FLAG \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_PATH" \
     -drive file=disk.raw,format=raw,if=virtio \
     -netdev user,id=n1,hostfwd=tcp::"$SSH_PORT"-:22 \
