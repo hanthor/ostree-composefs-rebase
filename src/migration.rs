@@ -113,6 +113,12 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
         .context("failed to create composefs image")?;
     println!("ComposeFS EROFS image created. Verity digest: {}", sha512_verity);
 
+    // Seal the image so it can be mounted
+    println!("Sealing composefs image...");
+    crate::composefs::seal_image(&config_digest)
+        .context("failed to seal composefs image")?;
+    println!("Image sealed successfully.");
+
     println!("=== Phase 4: Staging Deployment State ===");
     let deploy_dir = Path::new("/sysroot/state/deploy").join(&sha512_verity);
     fs::create_dir_all(&deploy_dir).context("failed to create deployment directory")?;
