@@ -281,9 +281,11 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     
     result.context("failed to copy boot files or create boot entries")?;
 
-    // Handle Btrfs subvolumes for /var
+    // Handle moving /var data to ComposeFS state directory
+    println!("=== Migrating /var data to ComposeFS state ===");
+    let target_var = Path::new("/sysroot/state/os/default/var");
+    
     if report.is_btrfs {
-        println!("Checking Btrfs /var layout...");
         // Check if /var is a separate mount
         let mounts = fs::read_to_string("/proc/mounts")?;
         let var_is_subvol = mounts.lines().any(|line| {
@@ -293,41 +295,45 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
         
         if var_is_subvol {
             println!("Preserving Btrfs 'var' subvolume mount.");
-            // Copy mount options to new etc/fstab
+            // Copy mount options to new etc/fstab in the deployment
             if let Ok(fstab_content) = fs::read_to_string("/etc/fstab") {
                 let mut new_fstab = String::new();
                 for line in fstab_content.lines() {
-                    if line.contains("/var") {
-                        // Keep it, but make sure it mounts to the correct physical location if needed
+                    if line.contains("/var") && !line.trim_start().starts_with('#') {
                         new_fstab.push_str(line);
                         new_fstab.push('\n');
                     }
                 }
-                let new_fstab_path = etc_dir.join("fstab");
-                let _ = fs::write(&new_fstab_path, new_fstab);
-            }
-        } else {
-            // Move directory to state directory
-            let target_var = Path::new("/sysroot/state/os/default/var");
-            if !target_var.exists() {
-                fs::create_dir_all(target_var.parent().unwrap())?;
-                println!("Moving /var data to ComposeFS state...");
-                // In-place move from ostree deployment var
-                let ostree_var = "/sysroot/ostree/deploy/default/var";
-                if Path::new(ostree_var).exists() {
-                    let _ = fs::rename(ostree_var, target_var);
-                } else {
-                    let _ = copy_dir_all("/var", target_var);
+                if !new_fstab.is_empty() {
+                    let new_fstab_path = etc_dir.join("fstab");
+                    let _ = fs::write(&new_fstab_path, new_fstab);
                 }
             }
+            // On separate /var subvolume, data stays in place; symlink resolves correctly
+            println!("/var is on a separate Btrfs subvolume — data stays in place.");
         }
-    } else {
-        // Flat copy for non-btrfs filesystems
-        let target_var = Path::new("/sysroot/state/os/default/var");
-        if !target_var.exists() {
-            fs::create_dir_all(target_var.parent().unwrap())?;
-            let _ = copy_dir_all("/var", target_var);
-        }
+    }
+    
+    // /var is not a separate mount — migrate data
+    if !target_var.exists() {
+        fs::create_dir_all(target_var.parent().unwrap())?;
+        
+        // Find the actual source of /var data
+        let source_var = if Path::new("/sysroot/ostree/deploy/default/var").exists() {
+            "/sysroot/ostree/deploy/default/var".to_string()
+        } else if Path::new("/sysroot/ostree/deploy/default/var").is_symlink() {
+            // Resolve the symlink to find the real var location
+            fs::read_link("/sysroot/ostree/deploy/default/var")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/sysroot/ostree/deploy/default/var".to_string())
+        } else {
+            "/var".to_string()
+        };
+        
+        println!("Migrating /var data from {} to ComposeFS state...", source_var);
+        copy_dir_all(&source_var, &target_var)
+            .context("failed to migrate /var data to ComposeFS state")?;
+        println!("/var data migrated successfully.");
     }
 
     println!("\n=== MIGRATION COMPLETED ===");

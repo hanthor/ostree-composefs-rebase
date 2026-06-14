@@ -157,14 +157,44 @@ SSHD_CONFIG_DIR="$MNT_DIR/ostree/deploy/default/var/etc/ssh"
 sudo mkdir -p "$SSHD_CONFIG_DIR"
 echo "PermitRootLogin yes" | sudo tee "$SSHD_CONFIG_DIR/sshd_config.d/90-e2e.conf" >/dev/null 2>&1 || true
 
-# Create a test file in /var to verify state preservation
-sudo mkdir -p "$MNT_DIR/ostree/deploy/default/var/lib/migration-test"
-echo "persistent-test-data-value" | sudo tee "$MNT_DIR/ostree/deploy/default/var/lib/migration-test/data" >/dev/null
+# Create test fixtures in /var to verify state preservation
+echo "=== Writing migration test fixtures ==="
+VAR_DIR="$MNT_DIR/ostree/deploy/default/var"
 
-# Create user home directory data to explicitly verify user home preservation
-sudo mkdir -p "$MNT_DIR/ostree/deploy/default/var/home/testuser"
-echo "hello-user-data-value" | sudo tee "$MNT_DIR/ostree/deploy/default/var/home/testuser/user-data.txt" >/dev/null
-sudo chmod -R 755 "$MNT_DIR/ostree/deploy/default/var/home/testuser"
+# Basic persistence marker
+sudo mkdir -p "$VAR_DIR/lib/migration-test"
+echo "persistent-test-data-value" | sudo tee "$VAR_DIR/lib/migration-test/data" >/dev/null
+echo "timestamp-$(date +%s)" | sudo tee "$VAR_DIR/lib/migration-test/created-at" >/dev/null
+
+# User home directories
+sudo mkdir -p "$VAR_DIR/home/testuser/.config"
+echo "hello-user-data-value" | sudo tee "$VAR_DIR/home/testuser/user-data.txt" >/dev/null
+echo "dotfile-content" | sudo tee "$VAR_DIR/home/testuser/.config/settings.conf" >/dev/null
+sudo chmod -R 755 "$VAR_DIR/home/testuser"
+
+# Second user with nested structure
+sudo mkdir -p "$VAR_DIR/home/devuser/projects/myapp/src"
+echo "package main" | sudo tee "$VAR_DIR/home/devuser/projects/myapp/src/main.go" >/dev/null
+echo "README for myapp" | sudo tee "$VAR_DIR/home/devuser/projects/myapp/README.md" >/dev/null
+sudo mkdir -p "$VAR_DIR/home/devuser/.ssh"
+echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..." | sudo tee "$VAR_DIR/home/devuser/.ssh/id_ed25519.pub" >/dev/null
+sudo chmod 700 "$VAR_DIR/home/devuser/.ssh"
+sudo chmod -R 755 "$VAR_DIR/home/devuser"
+
+# System service state
+sudo mkdir -p "$VAR_DIR/lib/systemd/timers"
+echo "stamp" | sudo tee "$VAR_DIR/lib/systemd/timers/test-timer" >/dev/null
+
+# Symlinks within /var
+sudo mkdir -p "$VAR_DIR/lib/alternatives"
+echo "selected-option" | sudo tee "$VAR_DIR/lib/alternatives/current" >/dev/null
+sudo ln -sf current "$VAR_DIR/lib/alternatives/default" 2>/dev/null || true
+
+# Hidden directory
+sudo mkdir -p "$VAR_DIR/cache/.hidden-dir"
+echo "hidden-file-content" | sudo tee "$VAR_DIR/cache/.hidden-dir/secret" >/dev/null
+
+echo "Test fixtures written."
 
 # Unmount loop device
 sudo umount "$MNT_DIR"
@@ -263,7 +293,7 @@ if [ "$BOOTED_BACKEND" = "null" ]; then
 fi
 echo "OK: Booted backend is ComposeFS."
 
-# Check state preservation
+# Basic persistence
 TEST_DATA_VAL=$(ssh $SSH_OPTS root@localhost "cat /var/lib/migration-test/data")
 if [ "$TEST_DATA_VAL" != "persistent-test-data-value" ]; then
     echo "FAIL: Persistent /var data was not preserved! (Found: $TEST_DATA_VAL)"
@@ -271,12 +301,65 @@ if [ "$TEST_DATA_VAL" != "persistent-test-data-value" ]; then
 fi
 echo "OK: Persistent /var data preserved."
 
-# Check user home preservation
+# User home files
 TEST_USER_DATA=$(ssh $SSH_OPTS root@localhost "cat /var/home/testuser/user-data.txt")
 if [ "$TEST_USER_DATA" != "hello-user-data-value" ]; then
     echo "FAIL: User home directory data was not preserved! (Found: $TEST_USER_DATA)"
     exit 1
 fi
 echo "OK: User home directory data preserved."
+
+# Hidden dotfile
+DOTFILE=$(ssh $SSH_OPTS root@localhost "cat /var/home/testuser/.config/settings.conf")
+if [ "$DOTFILE" != "dotfile-content" ]; then
+    echo "FAIL: Dotfile in .config was not preserved! (Found: $DOTFILE)"
+    exit 1
+fi
+echo "OK: Dotfiles preserved."
+
+# Second user with nested structure
+DEV_README=$(ssh $SSH_OPTS root@localhost "cat /var/home/devuser/projects/myapp/README.md")
+if [ "$DEV_README" != "README for myapp" ]; then
+    echo "FAIL: Nested user project data was not preserved! (Found: $DEV_README)"
+    exit 1
+fi
+echo "OK: Multi-user nested directory structure preserved."
+
+# SSH keys
+SSH_KEY=$(ssh $SSH_OPTS root@localhost "cat /var/home/devuser/.ssh/id_ed25519.pub")
+if [ -z "$SSH_KEY" ]; then
+    echo "FAIL: SSH keys were not preserved!"
+    exit 1
+fi
+echo "OK: SSH key files preserved."
+
+# System state
+TIMER=$(ssh $SSH_OPTS root@localhost "cat /var/lib/systemd/timers/test-timer")
+if [ "$TIMER" != "stamp" ]; then
+    echo "FAIL: Systemd timer state was not preserved! (Found: $TIMER)"
+    exit 1
+fi
+echo "OK: System state files preserved."
+
+# Symlinks
+SYMLINK_TARGET=$(ssh $SSH_OPTS root@localhost "readlink /var/lib/alternatives/default")
+if [ "$SYMLINK_TARGET" != "current" ]; then
+    echo "FAIL: Symlink was not preserved! (Found: $SYMLINK_TARGET)"
+    exit 1
+fi
+LINKED_DATA=$(ssh $SSH_OPTS root@localhost "cat /var/lib/alternatives/default")
+if [ "$LINKED_DATA" != "selected-option" ]; then
+    echo "FAIL: Symlink target content was not preserved!"
+    exit 1
+fi
+echo "OK: Symlinks preserved and functional."
+
+# Hidden directory
+HIDDEN=$(ssh $SSH_OPTS root@localhost "cat /var/cache/.hidden-dir/secret")
+if [ "$HIDDEN" != "hidden-file-content" ]; then
+    echo "FAIL: Hidden directory data was not preserved! (Found: $HIDDEN)"
+    exit 1
+fi
+echo "OK: Hidden directory data preserved."
 
 echo "=== E2E TEST PASSED SUCCESSFULY ==="
