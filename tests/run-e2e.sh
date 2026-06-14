@@ -13,17 +13,31 @@ SSH_PORT="${SSH_PORT:-2222}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+step() { printf '\033[1;36m[e2e %s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# Kill any stray QEMU/tail processes from a previous interrupted run so this
+# invocation isn't competing for SSH_PORT or polluting qemu.log with stale tails.
+step "Reaping stray processes from prior runs..."
+sudo pkill -9 -f "qemu-system.*hostfwd=tcp::${SSH_PORT}-" 2>/dev/null || true
+PIDS=$(pgrep -f "tail -F.*qemu.log" || true)
+[ -n "$PIDS" ] && sudo kill -9 $PIDS 2>/dev/null || true
+# Wait until the port is free so QEMU can bind it.
+for _ in $(seq 1 10); do
+    if ! sudo ss -lntp 2>/dev/null | grep -q ":${SSH_PORT} "; then break; fi
+    sleep 1
+done
+
 # Cleanup artifacts from previous runs
 rm -f "$WORKSPACE_DIR"/disk.raw "$WORKSPACE_DIR"/qemu.log "$WORKSPACE_DIR"/test_key "$WORKSPACE_DIR"/test_key.pub
 
-echo "=== E2E Test Configuration ==="
+step "=== E2E Test Configuration ==="
 echo "Base Image (OSTree):   $BASE_IMAGE"
 echo "Target Image (Cfs):    $TARGET_IMAGE"
 echo "Disk Size:             $DISK_SIZE"
 echo "Workspace:             $WORKSPACE_DIR"
 
 # 1. Preflight checks
-echo "=== Preflight checks ==="
+step "=== Preflight checks ==="
 if ! command -v qemu-system-x86_64 &>/dev/null; then
     echo "ERROR: qemu-system-x86_64 not found."
     exit 1
@@ -56,17 +70,17 @@ fi
 echo "Using UEFI firmware:   $OVMF_PATH"
 
 # 2. Build the migration binary
-echo "=== Building migration utility ==="
+step "=== Building migration utility ==="
 cd "$WORKSPACE_DIR"
 cargo build
 
 # 3. Create SSH key for E2E automation
-echo "=== Generating SSH test key ==="
+step "=== Generating SSH test key ==="
 rm -f ./test_key ./test_key.pub
 ssh-keygen -t rsa -N "" -f ./test_key
 
 # 4. Prepare bootable image with sshd enabled (some OSTree images like Bluefin disable sshd by default)
-echo "=== Preparing bootable image with sshd ==="
+step "=== Preparing bootable image with sshd ==="
 MODIFIED_IMAGE="localhost/e2e-bluefin-ssh:latest"
 
 # Create a Containerfile that enables sshd
@@ -133,13 +147,13 @@ echo "Using install image: $INSTALL_IMAGE"
 # 5. Create and initialize disk image (or restore checkpoint)
 CHECKPOINT="$WORKSPACE_DIR/disk.raw.pre-migration"
 if [ -f "$CHECKPOINT" ]; then
-    echo "=== Restoring pre-migration checkpoint ==="
+    step "=== Restoring pre-migration checkpoint ==="
     cp "$CHECKPOINT" disk.raw
     SKIP_SETUP=true
 
     # test_key is regenerated each run, so the checkpoint's stale authorized_keys
     # would lock us out. Reseed it with the fresh pubkey before booting.
-    echo "=== Reseeding authorized_keys in checkpoint ==="
+    step "=== Reseeding authorized_keys in checkpoint ==="
     CKPT_LOOP=$(sudo losetup --show -f -P disk.raw)
     # Find the btrfs root partition (p2 is the ESP on bootc-installed disks).
     CKPT_ROOT=""
@@ -166,33 +180,35 @@ else
     SKIP_SETUP=false
 fi
 
+# Install cleanup trap before any long-lived child processes are spawned, so
+# QEMU and serial-tail processes are reaped even when restoring from checkpoint
+# or if the script is interrupted (SIGINT/SIGTERM/EXIT).
+cleanup() {
+    if [ -n "${TAIL_PID:-}" ]; then
+        kill "$TAIL_PID" 2>/dev/null || true
+    fi
+    if [ -n "${QEMU_PID:-}" ]; then
+        step "Terminating QEMU (PID: $QEMU_PID)..."
+        sudo kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+    fi
+    if [ -n "${LOOP_DEV:-}" ]; then
+        step "Detaching loopback device $LOOP_DEV..."
+        sudo umount /tmp/mnt-e2e-disk 2>/dev/null || true
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+    fi
+    rm -f ./test_key ./test_key.pub
+}
+trap cleanup EXIT
+
 if [ "$SKIP_SETUP" = false ]; then
-echo "=== Creating disk image ==="
+step "=== Creating disk image ==="
 rm -f disk.raw
 truncate -s "$DISK_SIZE" disk.raw
 
 echo "Setting up loopback device..."
 LOOP_DEV=$(sudo losetup --show -f -P disk.raw)
 echo "Mounted loopback device: $LOOP_DEV"
-
-# Ensure cleanup on early exit
-cleanup() {
-    if [ -n "${TAIL_PID:-}" ]; then
-        kill "$TAIL_PID" 2>/dev/null || true
-    fi
-    if [ -n "${QEMU_PID:-}" ]; then
-        echo "Terminating QEMU (PID: $QEMU_PID)..."
-        sudo kill "$QEMU_PID" || true
-        wait "$QEMU_PID" || true
-    fi
-    if [ -n "${LOOP_DEV:-}" ]; then
-        echo "Detaching loopback device $LOOP_DEV..."
-        sudo umount /tmp/mnt-e2e-disk 2>/dev/null || true
-        sudo losetup -d "$LOOP_DEV" || true
-    fi
-    rm -f ./test_key ./test_key.pub
-}
-trap cleanup EXIT
 
 echo "Installing base OSTree bootc system to disk image..."
 # Run bootc install to-disk using podman on the loop device
@@ -215,7 +231,7 @@ LOOP_DEV=$(sudo losetup --show -f -P disk.raw)
 echo "Re-attached loop device: $LOOP_DEV"
 
 # 5. Inject SSH keys and configuration
-echo "=== Injecting SSH credentials to disk image ==="
+step "=== Injecting SSH credentials to disk image ==="
 # Create a temporary mount point
 MNT_DIR="/tmp/mnt-e2e-disk"
 sudo mkdir -p "$MNT_DIR"
@@ -238,7 +254,7 @@ sudo mkdir -p "$SSHD_CONFIG_DIR"
 echo "PermitRootLogin yes" | sudo tee "$SSHD_CONFIG_DIR/sshd_config.d/90-e2e.conf" >/dev/null 2>&1 || true
 
 # Create test fixtures in /var to verify state preservation
-echo "=== Writing migration test fixtures ==="
+step "=== Writing migration test fixtures ==="
 VAR_DIR="$MNT_DIR/ostree/deploy/default/var"
 
 # Basic persistence marker
@@ -279,7 +295,7 @@ echo "Test fixtures written."
 # Inject console=ttyS0 into BLS entries so the kernel logs to serial (visible
 # in qemu.log). Without this, desktop-flavored images like Bluefin send kernel
 # output only to the graphical console and we have zero visibility post-GRUB.
-echo "=== Patching BLS entries for serial console visibility ==="
+step "=== Patching BLS entries for serial console visibility ==="
 sudo umount "$MNT_DIR" || true
 BOOT_MNT="/tmp/mnt-e2e-boot"
 sudo mkdir -p "$BOOT_MNT"
@@ -318,7 +334,7 @@ cp disk.raw "$CHECKPOINT"
 fi  # SKIP_SETUP
 
 # 6. Launch QEMU VM
-echo "=== Booting VM under QEMU ==="
+step "=== Booting VM under QEMU ==="
 KVM_FLAG=""
 CPU_FLAG="-cpu max"
 if [ -e /dev/kvm ]; then
@@ -373,13 +389,13 @@ done
 
 if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
     echo "ERROR: VM did not become accessible via SSH within time limits."
-    echo "=== QEMU logs ==="
+    step "=== QEMU logs ==="
     cat qemu.log || true
     exit 1
 fi
 
 # 8. Verify target image is pullable (fast-fail before VM starts)
-echo "=== Verifying target image ==="
+step "=== Verifying target image ==="
 if ! curl -sf http://127.0.0.1:5000/v2/dakota/tags/list 2>/dev/null | grep -q stable; then
     echo "ERROR: dakota image not in local registry. Run: sudo podman tag ghcr.io/projectbluefin/dakota:stable 127.0.0.1:5000/dakota:stable && sudo podman push --tls-verify=false 127.0.0.1:5000/dakota:stable"
     exit 1
@@ -387,10 +403,10 @@ fi
 # Use local registry (host at 10.0.2.2 from QEMU) for fast VM pulls.
 VM_TARGET_IMAGE="10.0.2.2:5000/dakota:stable"
 
-echo "=== Copying migration utility to VM ==="
+step "=== Copying migration utility to VM ==="
 scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/var/tmp/bootc-migrate-composefs
 
-echo "=== Injecting /etc fixtures (live, copied by migration) ==="
+step "=== Injecting /etc fixtures (live, copied by migration) ==="
 ssh $SSH_OPTS root@localhost bash <<'ETCFIX'
 set -e
 # Allow insecure pulls from the host's local registry.
@@ -412,12 +428,12 @@ echo "real-home-data" > /var/home/realuser/home-marker.txt
 chown -R realuser:realuser /var/home/realuser
 ETCFIX
 
-echo "=== Running migration inside VM ==="
+step "=== Running migration inside VM ==="
 # Clean composefs state from previous runs so free-space check passes.
 ssh $SSH_OPTS root@localhost "rm -rf /sysroot/composefs /sysroot/state && mkdir -p /sysroot/composefs" 2>/dev/null || true
 ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs --target-image $VM_TARGET_IMAGE --force --skip-import"
 
-echo "=== Verifying migration artifacts before reboot ==="
+step "=== Verifying migration artifacts before reboot ==="
 ssh $SSH_OPTS root@localhost bash <<'DIAG'
 set +e
 echo '--- Deployments ---'
@@ -446,7 +462,7 @@ echo '--- efibootmgr ---'
 efibootmgr -v 2>/dev/null || echo 'no efibootmgr'
 DIAG
 
-echo "=== Rebooting VM ==="
+step "=== Rebooting VM ==="
 ssh $SSH_OPTS root@localhost "reboot" || true
 
 # Wait for VM to shutdown
@@ -473,13 +489,13 @@ done
 
 if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
     echo "ERROR: VM did not boot back after migration."
-    echo "=== QEMU logs ==="
+    step "=== QEMU logs ==="
     cat qemu.log || true
     exit 1
 fi
 
 # 10. Run post-migration validation checks
-echo "=== Running post-migration validation checks ==="
+step "=== Running post-migration validation checks ==="
 ssh $SSH_OPTS root@localhost "bootc status"
 
 # Check booted backend is composefs
@@ -609,4 +625,4 @@ if [ "$REALUSER_ENT" = "MISSING" ]; then
 fi
 echo "OK: User account from /etc/passwd preserved: $REALUSER_ENT"
 
-echo "=== E2E TEST PASSED SUCCESSFULY ==="
+step "=== E2E TEST PASSED SUCCESSFULY ==="
