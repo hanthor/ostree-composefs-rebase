@@ -62,7 +62,34 @@ echo "=== Generating SSH test key ==="
 rm -f ./test_key ./test_key.pub
 ssh-keygen -t rsa -N "" -f ./test_key
 
-# 4. Create and initialize disk image
+# 4. Prepare bootable image with sshd enabled (some OSTree images like Bluefin disable sshd by default)
+echo "=== Preparing bootable image with sshd ==="
+MODIFIED_IMAGE="localhost/e2e-bluefin-ssh:latest"
+
+# Create a Containerfile that enables sshd
+TMP_CONTAINERFILE=$(mktemp)
+cat > "$TMP_CONTAINERFILE" <<'DOCKERFILE'
+FROM BASE_IMAGE_PLACEHOLDER
+# Enable sshd via systemd preset (required on images where sshd is preset-disabled)
+RUN mkdir -p /usr/lib/systemd/system-preset && \
+    echo 'enable sshd.service' > /usr/lib/systemd/system-preset/50-e2e-ssh.preset && \
+    echo 'enable sshd.socket' >> /usr/lib/systemd/system-preset/50-e2e-ssh.preset
+# Allow root login
+RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
+    echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
+DOCKERFILE
+
+# Substitute the base image
+sed -i "s|BASE_IMAGE_PLACEHOLDER|$BASE_IMAGE|g" "$TMP_CONTAINERFILE"
+
+echo "Building modified image with sshd enabled..."
+sudo podman build --pull-always -t "$MODIFIED_IMAGE" -f "$TMP_CONTAINERFILE"
+rm -f "$TMP_CONTAINERFILE"
+
+INSTALL_IMAGE="$MODIFIED_IMAGE"
+echo "Using install image: $INSTALL_IMAGE"
+
+# 5. Create and initialize disk image
 echo "=== Creating disk image ==="
 rm -f disk.raw
 truncate -s "$DISK_SIZE" disk.raw
@@ -94,7 +121,7 @@ sudo podman run --privileged --pid=host --rm \
     -v /var/tmp:/var/tmp \
     -v /tmp:/tmp \
     -v "$WORKSPACE_DIR":/workspace \
-    "$BASE_IMAGE" \
+    "$INSTALL_IMAGE" \
     bootc install to-disk \
     --generic-image \
     --filesystem btrfs \
@@ -125,10 +152,10 @@ sudo cp ./test_key.pub "$ROOT_SSH_DIR/authorized_keys"
 sudo chmod 600 "$ROOT_SSH_DIR/authorized_keys"
 sudo chown -R 0:0 "$ROOT_SSH_DIR"
 
-# Ensure SSH permits root login
+# Ensure SSH permits root login (already in derived image, but double-check)
 SSHD_CONFIG_DIR="$MNT_DIR/ostree/deploy/default/var/etc/ssh"
 sudo mkdir -p "$SSHD_CONFIG_DIR"
-echo "PermitRootLogin yes" | sudo tee -a "$SSHD_CONFIG_DIR/sshd_config" >/dev/null
+echo "PermitRootLogin yes" | sudo tee "$SSHD_CONFIG_DIR/sshd_config.d/90-e2e.conf" >/dev/null 2>&1 || true
 
 # Create a test file in /var to verify state preservation
 sudo mkdir -p "$MNT_DIR/ostree/deploy/default/var/lib/migration-test"

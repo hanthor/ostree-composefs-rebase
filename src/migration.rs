@@ -21,6 +21,21 @@ pub fn inspect_image(image_id: &str) -> Result<String> {
 
 pub fn mount_image(image_id: &str, mount_path: &Path) -> Result<()> {
     let mount_str = mount_path.to_str().ok_or_else(|| anyhow!("invalid mount path"))?;
+    
+    // Try direct erofs mount of the backing file first (simpler, no seal required)
+    let image_path = Path::new("/sysroot/composefs/images").join(image_id);
+    if image_path.exists() {
+        let output = Command::new("mount")
+            .args(["-t", "erofs", "-o", "ro,loop", 
+                   image_path.to_str().unwrap_or(""), mount_str])
+            .output()
+            .context("failed to mount erofs image")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        // Fall through to bootc cfs oci mount
+    }
+    
     let output = Command::new("bootc")
         .args(["internals", "cfs", "--system", "oci", "mount", image_id, mount_str])
         .output()
@@ -163,8 +178,10 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     let _ = fs::remove_dir_all(&temp_mount);
     fs::create_dir_all(&temp_mount)?;
     
+    // The EROFS image is stored under the verity digest (sha512 hash) in /sysroot/composefs/images/
+    let image_path_id = sha512_verity.strip_prefix("sha512:").unwrap_or(&sha512_verity);
     println!("Mounting ComposeFS image to extract boot artifacts...");
-    mount_image(&config_digest, &temp_mount).context("failed to mount composefs image")?;
+    mount_image(image_path_id, &temp_mount).context("failed to mount composefs image")?;
     
     let result = (|| -> Result<()> {
         // Find kernel version from mounted image /usr/lib/modules
