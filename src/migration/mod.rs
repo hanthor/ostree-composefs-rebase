@@ -422,6 +422,17 @@ fn phase4_var_migration(etc_dir: &Path, _dry_run: bool) -> Result<()> {
 
     if var_is_subvol {
         println!("Preserving Btrfs 'var' subvolume mount.");
+        // bootc-root-setup in the initramfs bind-mounts state/os/default/var onto the
+        // pivoted root's /var; if the source path doesn't exist as a directory it bails
+        // out into emergency mode. The actual var subvol stays mounted at /var on the
+        // running system; we just need the empty target to exist.
+        if let Err(e) = fs::create_dir_all(target_var) {
+            eprintln!(
+                "Warning: failed to create {} for initramfs var bind-mount target: {}",
+                target_var.display(),
+                e
+            );
+        }
         if let Ok(fstab_content) = fs::read_to_string("/etc/fstab") {
             let mut new_fstab = String::new();
             for line in fstab_content.lines() {
