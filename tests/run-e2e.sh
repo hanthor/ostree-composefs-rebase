@@ -70,10 +70,18 @@ MODIFIED_IMAGE="localhost/e2e-bluefin-ssh:latest"
 TMP_CONTAINERFILE=$(mktemp)
 cat > "$TMP_CONTAINERFILE" <<'DOCKERFILE'
 FROM BASE_IMAGE_PLACEHOLDER
-# Enable sshd via systemd preset (required on images where sshd is preset-disabled)
+# Preset (covers fresh boots) AND direct symlink (covers images where sshd
+# was already preset-disabled at build time — the preset file alone wouldn't
+# re-enable it). systemctl enable in a build container only writes symlinks,
+# which is exactly what we want.
 RUN mkdir -p /usr/lib/systemd/system-preset && \
     echo 'enable sshd.service' > /usr/lib/systemd/system-preset/50-e2e-ssh.preset && \
     echo 'enable sshd.socket' >> /usr/lib/systemd/system-preset/50-e2e-ssh.preset
+RUN systemctl enable sshd.service && systemctl enable sshd.socket || true
+# Direct symlink fallback in case systemctl enable was a no-op
+RUN mkdir -p /usr/lib/systemd/system/multi-user.target.wants && \
+    ln -sf /usr/lib/systemd/system/sshd.service \
+           /usr/lib/systemd/system/multi-user.target.wants/sshd.service
 # Allow root login
 RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
     echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
@@ -100,6 +108,9 @@ echo "Mounted loopback device: $LOOP_DEV"
 
 # Ensure cleanup on early exit
 cleanup() {
+    if [ -n "${TAIL_PID:-}" ]; then
+        kill "$TAIL_PID" 2>/dev/null || true
+    fi
     if [ -n "${QEMU_PID:-}" ]; then
         echo "Terminating QEMU (PID: $QEMU_PID)..."
         sudo kill "$QEMU_PID" || true
@@ -196,9 +207,39 @@ echo "hidden-file-content" | sudo tee "$VAR_DIR/cache/.hidden-dir/secret" >/dev/
 
 echo "Test fixtures written."
 
+# Inject console=ttyS0 into BLS entries so the kernel logs to serial (visible
+# in qemu.log). Without this, desktop-flavored images like Bluefin send kernel
+# output only to the graphical console and we have zero visibility post-GRUB.
+echo "=== Patching BLS entries for serial console visibility ==="
+sudo umount "$MNT_DIR" || true
+BOOT_MNT="/tmp/mnt-e2e-boot"
+sudo mkdir -p "$BOOT_MNT"
+PATCHED=0
+for part in "${LOOP_DEV}p1" "${LOOP_DEV}p2" "${LOOP_DEV}p3" "${LOOP_DEV}p4"; do
+    [ -b "$part" ] || continue
+    sudo mount "$part" "$BOOT_MNT" 2>/dev/null || continue
+    # The BLS entries dir may live at the partition root (dedicated /boot
+    # partition) or at /boot/loader/entries (root partition).
+    for entries in "$BOOT_MNT/loader/entries" "$BOOT_MNT/boot/loader/entries"; do
+        if [ -d "$entries" ]; then
+            echo "Found BLS entries at $entries (on $part)"
+            for conf in "$entries"/*.conf; do
+                [ -f "$conf" ] || continue
+                if ! grep -q 'console=ttyS0' "$conf"; then
+                    sudo sed -i 's|^\(options .*\)$|\1 console=ttyS0,115200n8 console=tty0 systemd.log_level=info|' "$conf"
+                    echo "  patched: $(basename "$conf")"
+                    PATCHED=$((PATCHED + 1))
+                fi
+            done
+        fi
+    done
+    sudo umount "$BOOT_MNT"
+done
+sudo rmdir "$BOOT_MNT"
+echo "Patched $PATCHED BLS entries with serial console kernel args."
+
 # Unmount loop device
-sudo umount "$MNT_DIR"
-sudo rmdir "$MNT_DIR"
+sudo rmdir "$MNT_DIR" 2>/dev/null || true
 sudo losetup -d "$LOOP_DEV"
 # Reset loop variable so cleanup doesn't try to double-detach
 LOOP_DEV=""
@@ -233,9 +274,18 @@ ATTEMPT=1
 SSH_OPTS="-i ./test_key -p $SSH_PORT -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 SCP_OPTS="-i ./test_key -P $SSH_PORT -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
+# Stream qemu serial output in the background so we see boot progress in CI.
+# Strip ANSI sequences (GRUB draws a TUI) and prefix each line for clarity.
+( tail -F -q qemu.log 2>/dev/null \
+  | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[()][0-9A-Za-z]//g' \
+  | awk '{ print "[vm-serial] " $0; fflush() }' ) &
+TAIL_PID=$!
+
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
     if ssh $SSH_OPTS root@localhost true 2>/dev/null; then
         echo "VM is accessible via SSH!"
+        kill "$TAIL_PID" 2>/dev/null || true
+        TAIL_PID=""
         break
     fi
     sleep 3
@@ -312,10 +362,17 @@ sleep 5
 
 # 9. Wait for VM to boot back
 echo "Waiting for VM to boot back after migration..."
+# Re-arm serial streaming so post-migration boot is visible too.
+( tail -F -q -n 0 qemu.log 2>/dev/null \
+  | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[()][0-9A-Za-z]//g' \
+  | awk '{ print "[vm-serial:post] " $0; fflush() }' ) &
+TAIL_PID=$!
 ATTEMPT=1
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
     if ssh $SSH_OPTS root@localhost true 2>/dev/null; then
         echo "VM is accessible via SSH after reboot!"
+        kill "$TAIL_PID" 2>/dev/null || true
+        TAIL_PID=""
         break
     fi
     sleep 3
