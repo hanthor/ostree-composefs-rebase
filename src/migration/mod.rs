@@ -563,19 +563,14 @@ fn phase5_setup_bootloader(
 ) -> Result<()> {
     println!("=== Phase 5: Setting Up Bootloader ===");
 
-    // systemd-boot is default when UEFI + NVRAM writable, unless user forces grub2.
-    let mut use_systemd_boot = bootloader != "grub2" && report.is_uefi && report.nvram_writable;
-
-    // Pre-check: bootctl install needs the systemd-boot binaries installed in the
-    // running deployment. If they're missing, skip straight to GRUB2 rather than
-    // writing BLS entries to the ESP that the firmware can't read.
-    if use_systemd_boot && !report.systemd_boot_binaries_present {
-        eprintln!(
-            "Warning: systemd-boot binaries not present at /usr/lib/systemd/boot/efi. \
-             Falling back to GRUB2 (composefs entry will be written to /boot/loader/entries)."
-        );
-        use_systemd_boot = false;
-    }
+    // systemd-boot is default when UEFI + NVRAM writable + ESP ready, unless user forces grub2.
+    // We no longer require systemd-boot binaries in the *source* OS: Phase 5 extracts the
+    // binary from the mounted *target* composefs image and installs it directly. If the
+    // target also doesn't ship systemd-boot, Phase 5 falls back to GRUB2 automatically.
+    let use_systemd_boot = bootloader != "grub2"
+        && report.is_uefi
+        && report.nvram_writable
+        && report.esp_ready_for_systemd_boot;
 
     // Optional: Phase 5 idempotency — check if composefs entry already exists.
     let esp = if use_systemd_boot {
@@ -647,73 +642,86 @@ fn phase5_setup_bootloader(
     // Write to staged entries first (#9), then atomically rename.
     let mut entries: Vec<bootloader::BlsEntry> = Vec::new();
 
+    // Track whether we actually completed the systemd-boot install. If extraction from the
+    // target image fails, we fall through to the GRUB2 branch instead of erroring out so the
+    // user always ends up with a bootable system.
+    let mut sd_boot_installed = false;
     if use_systemd_boot {
         let esp = esp.as_ref().unwrap();
-        // Install systemd-boot (pre-check at phase entry confirmed binaries exist).
-        println!("Installing systemd-boot on ESP: {}...", esp);
-        let bootctl = Command::new("bootctl")
-            .args(["--path", esp, "install"])
-            .status()
-            .context("failed to invoke bootctl")?;
-        if !bootctl.success() {
-            return Err(anyhow!(
-                "bootctl install on ESP {} failed (exit {:?}). \
-                 Without systemd-bootx64.efi on the ESP, written BLS entries are unreachable. \
-                 Re-run with --bootloader grub2 or install the systemd-boot package first.",
-                esp, bootctl.code()
-            ));
+        let esp_path = Path::new(esp);
+
+        match install_systemd_boot_from_target(esp_path, &mount_path) {
+            Ok(()) => {
+                // Copy composefs kernel+initrd to ESP.
+                let boot_dir_name = format!("bootc_composefs-{}", verity.as_hex());
+                let esp_boot_dir = esp_path.join("EFI/Linux").join(&boot_dir_name);
+                fs::create_dir_all(&esp_boot_dir)?;
+                fs::copy(&vmlinuz_src, esp_boot_dir.join("vmlinuz"))?;
+                if initrd_src.exists() {
+                    fs::copy(&initrd_src, esp_boot_dir.join("initrd"))?;
+                }
+
+                // Build composefs BLS entry.
+                let composefs_entry = bootloader::BlsEntry {
+                    title: bls_entry_title(&target_os, "composefs"),
+                    version: kver.clone(),
+                    linux: format!("/EFI/Linux/{}/vmlinuz", boot_dir_name),
+                    initrd: format!("/EFI/Linux/{}/initrd", boot_dir_name),
+                    options: options_str.clone(),
+                    filename: bls_entry_filename(&target_os, verity.as_hex(), 1),
+                    sort_key: format!("bootc-{}-0", target_os.id),
+                };
+
+                // Build OSTree fallback BLS targeting the ESP (kernel+initrd copied alongside).
+                let ostree_fallback = build_ostree_fallback_on_esp(esp_path).ok();
+
+                // Stage + atomic-rename both entries.
+                let staged_dir = esp_path.join("loader/entries.staged");
+                fs::create_dir_all(&staged_dir)?;
+                let entries_dir = esp_path.join("loader/entries");
+                fs::create_dir_all(&entries_dir)?;
+                let mut to_promote: Vec<&bootloader::BlsEntry> = vec![&composefs_entry];
+                if let Some(ref fb) = ostree_fallback {
+                    to_promote.push(fb);
+                }
+                for entry in &to_promote {
+                    fs::write(staged_dir.join(&entry.filename), entry.render())?;
+                    fs::rename(
+                        staged_dir.join(&entry.filename),
+                        entries_dir.join(&entry.filename),
+                    ).with_context(|| format!("failed to promote ESP BLS entry: {}", entry.filename))?;
+                }
+
+                // loader.conf: composefs is the default, 3s timeout so the user can pick the
+                // OSTree fallback during the evaluation window.
+                let default_id = composefs_entry.filename.trim_end_matches(".conf");
+                let loader_conf = format!(
+                    "default {}\ntimeout 3\nconsole-mode keep\n",
+                    default_id
+                );
+                fs::write(esp_path.join("loader/loader.conf"), loader_conf)
+                    .context("failed to write loader.conf")?;
+
+                // Register Linux Boot Manager in NVRAM (best-effort).
+                register_systemd_boot_nvram(esp);
+
+                sd_boot_installed = true;
+                println!(
+                    "systemd-boot installed from target image. Composefs is the default; \
+                     OSTree fallback available in the loader menu (3s timeout)."
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not install systemd-boot from target image ({}). \
+                     Falling back to GRUB2 path.",
+                    e
+                );
+            }
         }
+    }
 
-        // Copy composefs kernel+initrd to ESP for systemd-boot.
-        let boot_dir_name = format!("bootc_composefs-{}", verity.as_hex());
-        let esp_boot_dir = Path::new(&esp).join("EFI/Linux").join(&boot_dir_name);
-        fs::create_dir_all(&esp_boot_dir)?;
-        fs::copy(&vmlinuz_src, esp_boot_dir.join("vmlinuz"))?;
-        if initrd_src.exists() {
-            fs::copy(&initrd_src, esp_boot_dir.join("initrd"))?;
-        }
-
-        // Write composefs BLS entry to ESP (systemd-boot reads from here).
-        let composefs_entry = bootloader::BlsEntry {
-            title: bls_entry_title(&target_os, "composefs"),
-            version: kver.clone(),
-            linux: format!("/EFI/Linux/{}/vmlinuz", boot_dir_name),
-            initrd: format!("/EFI/Linux/{}/initrd", boot_dir_name),
-            options: options_str.clone(),
-            filename: bls_entry_filename(&target_os, verity.as_hex(), 1),
-            sort_key: format!("bootc-{}-0", target_os.id),
-        };
-
-        let staged_dir = Path::new(&esp).join("loader/entries.staged");
-        fs::create_dir_all(&staged_dir)?;
-        fs::write(staged_dir.join(&composefs_entry.filename), composefs_entry.render())?;
-
-        let entries_dir = Path::new(&esp).join("loader/entries");
-        fs::create_dir_all(&entries_dir)?;
-        fs::rename(
-            staged_dir.join(&composefs_entry.filename),
-            entries_dir.join(&composefs_entry.filename),
-        ).with_context(|| format!("failed to promote staged entry: {}", composefs_entry.filename))?;
-
-        // Write OSTree fallback to /boot/loader/entries/ (GRUB2 still reads from here).
-        // GRUB2 is kept in UEFI boot menu as the fallback bootloader.
-        if let Ok(ostree_entry) = build_ostree_fallback_entry() {
-            let grub_staged = Path::new("/boot/loader/entries.staged");
-            fs::create_dir_all(&grub_staged)?;
-            fs::write(grub_staged.join(&ostree_entry.filename), ostree_entry.render())?;
-            let grub_entries = Path::new("/boot/loader/entries");
-            fs::create_dir_all(&grub_entries)?;
-            fs::rename(
-                grub_staged.join(&ostree_entry.filename),
-                grub_entries.join(&ostree_entry.filename),
-            ).with_context(|| format!("failed to promote fallback entry: {}", ostree_entry.filename))?;
-
-            // Set GRUB2 default to the OSTree fallback.
-            let _ = Command::new("grub2-set-default")
-                .arg("ostree-fallback-0")
-                .status();
-        }
-    } else {
+    if !sd_boot_installed {
         // GRUB2 path
         println!("Staying on GRUB2 bootloader (BLS Type 1)...");
         let boot_dir_name = format!("bootc_composefs-{}", verity.as_hex());
@@ -758,26 +766,38 @@ fn phase5_setup_bootloader(
                 .with_context(|| format!("failed to promote staged entry: {}", entry.filename))?;
         }
 
-        // Use grub2-reboot for one-shot (#8).
+        // Set the composefs entry as the persistent default via saved_entry.
+        // bootupd-shipped grub.cfg only has `set default="${saved_entry}"` — it does NOT
+        // include the `if [ "${next_entry}" ]` one-shot block, so grub2-reboot's
+        // next_entry is silently ignored. Set saved_entry directly. We also still call
+        // grub2-reboot so distros that DO honor next_entry get the one-shot semantics
+        // (revert on failed boot), but we don't rely on it.
         let composefs_entry_id = bls_entry_filename(&target_os, verity.as_hex(), 1);
         let entry_id = composefs_entry_id.trim_end_matches(".conf");
         let grubenv = "/boot/grub2/grubenv";
-        let rb = Command::new("grub2-reboot")
-            .arg(entry_id)
-            .status();
-        if !matches!(rb, Ok(s) if s.success()) {
-            let ee = Command::new("grub2-editenv")
-                .args([grubenv, "set", &format!("saved_entry={}", entry_id)])
-                .status();
-            if !matches!(ee, Ok(s) if s.success()) {
-                let fallback = Command::new("grub2-set-default")
-                    .arg(entry_id)
-                    .status();
-                if !matches!(fallback, Ok(s) if s.success()) {
-                    eprintln!("Warning: all grub default-set methods failed. The composefs entry may not be the default boot target.");
-                }
+
+        let saved_ok = Command::new("grub2-editenv")
+            .args([grubenv, "set", &format!("saved_entry={}", entry_id)])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !saved_ok {
+            // Fall back to grub2-set-default which writes through to grubenv.
+            let sd_ok = Command::new("grub2-set-default")
+                .arg(entry_id)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !sd_ok {
+                eprintln!(
+                    "Warning: failed to set grub saved_entry={}. Composefs may not be the default boot target.",
+                    entry_id
+                );
             }
         }
+
+        // Best-effort one-shot for distros with the next_entry block.
+        let _ = Command::new("grub2-reboot").arg(entry_id).status();
 
         // Ensure GRUB_DEFAULT=saved in /etc/default/grub (Fix 4: propagate error)
         let grub_defaults_path = "/etc/default/grub";
@@ -816,6 +836,117 @@ fn phase5_setup_bootloader(
     }
 
     Ok(())
+}
+
+/// Copy systemd-boot binaries from the mounted target image to the ESP.
+/// This avoids needing systemd-boot installed in the *source* OS (Bluefin) — we lift
+/// it straight out of the Dakota image that's already mounted for kernel extraction.
+fn install_systemd_boot_from_target(esp_path: &Path, mount_path: &Path) -> Result<()> {
+    let src = mount_path.join("usr/lib/systemd/boot/efi/systemd-bootx64.efi");
+    if !src.exists() {
+        return Err(anyhow!(
+            "target image does not ship systemd-boot at /usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+        ));
+    }
+
+    // Primary loader path systemd-boot itself uses.
+    let sd_dir = esp_path.join("EFI/systemd");
+    fs::create_dir_all(&sd_dir)?;
+    fs::copy(&src, sd_dir.join("systemd-bootx64.efi"))
+        .context("failed to install systemd-bootx64.efi to ESP")?;
+
+    // Removable-media fallback path so the firmware will boot it even if NVRAM is wiped.
+    let removable_dir = esp_path.join("EFI/BOOT");
+    fs::create_dir_all(&removable_dir)?;
+    fs::copy(&src, removable_dir.join("BOOTX64.EFI"))
+        .context("failed to install BOOTX64.EFI removable-media loader")?;
+
+    Ok(())
+}
+
+/// Register `Linux Boot Manager` in UEFI NVRAM pointing at the systemd-boot loader.
+/// Idempotent — skips if an entry by that label already exists. Best-effort: warns
+/// on failure instead of erroring, since the removable-media loader at \EFI\BOOT\BOOTX64.EFI
+/// keeps the system bootable as a last resort.
+fn register_systemd_boot_nvram(esp_path: &str) {
+    if let Ok(out) = Command::new("efibootmgr").arg("-v").output() {
+        let txt = String::from_utf8_lossy(&out.stdout);
+        if txt.lines().any(|l| l.contains("Linux Boot Manager")) {
+            println!("Linux Boot Manager already registered in UEFI NVRAM.");
+            return;
+        }
+    }
+
+    let (disk, part) = match get_esp_disk_and_part(esp_path) {
+        Some(dp) => dp,
+        None => {
+            eprintln!(
+                "Warning: could not parse ESP device for efibootmgr. \
+                 systemd-boot binary is on the ESP at \\EFI\\BOOT\\BOOTX64.EFI \
+                 (removable-media path) but no NVRAM entry was created."
+            );
+            return;
+        }
+    };
+
+    let status = Command::new("efibootmgr")
+        .args([
+            "--create",
+            "--disk", &disk,
+            "--part", &part,
+            "--loader", "\\EFI\\systemd\\systemd-bootx64.efi",
+            "--label", "Linux Boot Manager",
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("Registered 'Linux Boot Manager' in UEFI NVRAM."),
+        Ok(s) => eprintln!(
+            "Warning: efibootmgr --create failed (exit {:?}). \
+             Removable-media loader at \\EFI\\BOOT\\BOOTX64.EFI remains as fallback.",
+            s.code()
+        ),
+        Err(e) => eprintln!("Warning: failed to invoke efibootmgr ({}).", e),
+    }
+}
+
+/// Build an OSTree fallback BLS entry placed on the ESP (systemd-boot path).
+/// Copies the running OSTree deployment's kernel/initrd to <esp>/EFI/Linux/ostree-fallback/.
+fn build_ostree_fallback_on_esp(esp_path: &Path) -> Result<bootloader::BlsEntry> {
+    let (deploy_root, _checksum) = find_ostree_deployment()?;
+
+    let modules_dir = deploy_root.join("usr/lib/modules");
+    let kver = fs::read_dir(&modules_dir)?
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("no kernel version in OSTree deployment"))?;
+
+    let vmlinuz_path = modules_dir.join(&kver).join("vmlinuz");
+    let initrd_path = modules_dir.join(&kver).join("initramfs.img");
+
+    let fallback_dir = esp_path.join("EFI/Linux/ostree-fallback");
+    fs::create_dir_all(&fallback_dir)?;
+    if vmlinuz_path.exists() {
+        fs::copy(&vmlinuz_path, fallback_dir.join("vmlinuz"))?;
+    }
+    if initrd_path.exists() {
+        fs::copy(&initrd_path, fallback_dir.join("initrd"))?;
+    }
+
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let options: Vec<&str> = cmdline.split_whitespace()
+        .filter(|w| !w.starts_with("composefs="))
+        .collect();
+
+    Ok(bootloader::BlsEntry {
+        title: "Bluefin (OSTree fallback)".into(),
+        version: kver,
+        linux: "/EFI/Linux/ostree-fallback/vmlinuz".into(),
+        initrd: "/EFI/Linux/ostree-fallback/initrd".into(),
+        options: options.join(" "),
+        filename: "ostree-fallback-0.conf".into(),
+        sort_key: "ostree-fallback-99".into(),
+    })
 }
 
 /// Build a fallback BLS entry for the OSTree deployment — GRUB2 path (copies to /boot).

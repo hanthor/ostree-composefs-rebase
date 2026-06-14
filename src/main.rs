@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -162,7 +162,7 @@ fn main() {
         issues.push("ESP too small for systemd-boot — need >=150 MB free; will use GRUB2 instead.");
     }
     if report.is_uefi && !report.systemd_boot_binaries_present {
-        issues.push("systemd-boot binaries missing in deployment — bootctl install would fail; will use GRUB2 instead.");
+        issues.push("systemd-boot binaries missing in source OS — migration will extract them from the target image instead.");
     }
     if !report.grub_tools_available {
         issues.push("No GRUB tools (grub2-reboot, grub2-editenv) — one-shot boot selection may fail.");
@@ -183,9 +183,10 @@ fn main() {
         }
     }
 
-    let use_systemd_boot = report.esp_ready_for_systemd_boot
-        && report.nvram_writable
-        && report.systemd_boot_binaries_present;
+    // We migrate to systemd-boot by lifting the loader binary out of the target image,
+    // so the source OS no longer needs to ship systemd-boot. The systemd_boot_binaries_present
+    // field is now purely informational (warning if neither side ships it).
+    let use_systemd_boot = report.esp_ready_for_systemd_boot && report.nvram_writable;
     if use_systemd_boot {
         println!("\nBootloader: Will migrate to systemd-boot (ESP ready, NVRAM writable).");
     } else if report.esp_path.is_some() {
@@ -281,9 +282,32 @@ fn run_commit() -> Result<()> {
     let primary = composefs_entries[0].trim_end_matches(".conf");
 
     if is_systemd_boot {
-        println!("Systemd-boot detected. The composefs entry '{}' should be the default via sort-key.", primary);
-        println!("To make it permanent, ensure its sort-key is the lowest value in loader/entries/.");
-        println!("Commit complete (no grub2-set-default needed for systemd-boot).");
+        // Remove the OSTree fallback entry + its kernel/initrd from the ESP so the next
+        // boot menu only shows the composefs entry. The composefs entry remains the
+        // loader.conf default; nothing else needs to change.
+        let esp_root = entries_dir.parent().and_then(|p| p.parent());
+        if let Some(esp_root) = esp_root {
+            let fallback_entry = entries_dir.join("ostree-fallback-0.conf");
+            if fallback_entry.exists() {
+                std::fs::remove_file(&fallback_entry)
+                    .with_context(|| format!("failed to remove {}", fallback_entry.display()))?;
+                println!("Removed OSTree fallback BLS entry from ESP.");
+            }
+            let fallback_dir = esp_root.join("EFI/Linux/ostree-fallback");
+            if fallback_dir.exists() {
+                std::fs::remove_dir_all(&fallback_dir)
+                    .with_context(|| format!("failed to remove {}", fallback_dir.display()))?;
+                println!("Removed OSTree fallback kernel/initrd from ESP.");
+            }
+            // Drop the timeout now that composefs is the only entry.
+            let loader_conf = esp_root.join("loader/loader.conf");
+            if loader_conf.exists() {
+                let body = format!("default {}\ntimeout 0\nconsole-mode keep\n", primary);
+                std::fs::write(&loader_conf, body)
+                    .with_context(|| format!("failed to rewrite {}", loader_conf.display()))?;
+            }
+        }
+        println!("Composefs deployment '{}' committed as the permanent systemd-boot default.", primary);
     } else {
         let status = std::process::Command::new("grub2-set-default")
             .arg(primary)
@@ -291,6 +315,9 @@ fn run_commit() -> Result<()> {
         if !matches!(status, Ok(s) if s.success()) {
             anyhow::bail!("failed to set GRUB default");
         }
+        // Drop GRUB2-side OSTree fallback artifacts too.
+        let _ = std::fs::remove_file("/boot/loader/entries/ostree-fallback-0.conf");
+        let _ = std::fs::remove_dir_all("/boot/ostree-fallback");
         println!("Composefs deployment '{}' is now the permanent default.", primary);
     }
 
