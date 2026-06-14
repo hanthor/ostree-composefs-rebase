@@ -531,26 +531,42 @@ pub fn inspect_image(image_id: &str) -> Result<String> {
 
 pub fn mount_image(image_id: &str, mount_path: &Path) -> Result<()> {
     let mount_str = mount_path.to_str().ok_or_else(|| anyhow!("invalid mount path"))?;
-    let image_path = Path::new("/sysroot/composefs/images").join(image_id);
-    if image_path.exists() {
-        let output = Command::new("/usr/bin/mount")
-            .args(["-t", "erofs", "-o", "ro,loop",
-                   image_path.to_str().unwrap_or(""), mount_str])
-            .output()
-            .context("failed to mount erofs image")?;
-        if output.status.success() {
-            return Ok(());
-        }
-    }
+
+    // Always prefer the bootc composefs overlay mount: it stacks the EROFS
+    // metadata layer on top of the content-addressed object tree at
+    // /sysroot/composefs/objects so files read back with their actual content.
+    // A bare `mount -t erofs` returns metadata-only views (sizes look right but
+    // file contents are zero-filled), which silently corrupts every artifact
+    // Phase 5 copies out of the mount (kernel, initrd, systemd-bootx64.efi…).
     let output = Command::new("bootc")
         .args(["internals", "cfs", "--system", "oci", "mount", image_id, mount_str])
         .output()
         .context("failed to execute bootc internals cfs oci mount")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("mount failed: {}", stderr));
+    if output.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    // Last-resort fallback: raw EROFS mount. This works only if every file
+    // copied out of the mount happens to be inline (small enough to live in
+    // the EROFS metadata). Reserved for environments where bootc is missing.
+    let bootc_err = String::from_utf8_lossy(&output.stderr).into_owned();
+    let image_path = Path::new("/sysroot/composefs/images").join(image_id);
+    if image_path.exists() {
+        let fallback = Command::new("/usr/bin/mount")
+            .args(["-t", "erofs", "-o", "ro,loop",
+                   image_path.to_str().unwrap_or(""), mount_str])
+            .output()
+            .context("failed to mount erofs image (bootc cfs fallback)")?;
+        if fallback.status.success() {
+            eprintln!(
+                "Warning: bootc cfs mount failed ({}), fell back to raw EROFS — \
+                 file content beyond the inline threshold will read as zeros.",
+                bootc_err.trim()
+            );
+            return Ok(());
+        }
+    }
+    Err(anyhow!("mount failed: {}", bootc_err))
 }
 
 // ---- Phase 5 (#6, #8, #9) ----
