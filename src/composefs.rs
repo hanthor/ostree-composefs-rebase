@@ -19,7 +19,15 @@ pub fn pull_image(image_ref: &str) -> Result<String> {
     }
     
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The pull command typically prints the manifest digest or image ID
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("manifest ") {
+            let digest = trimmed["manifest ".len()..].trim().to_string();
+            return Ok(digest);
+        }
+    }
+    
+    // Fallback if not found
     Ok(stdout.trim().to_string())
 }
 
