@@ -194,10 +194,10 @@ fi
 
 # 8. Copy and run the migration utility
 echo "=== Copying migration utility to VM ==="
-scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/usr/local/bin/bootc-migrate-composefs
+scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/var/tmp/bootc-migrate-composefs
 
 echo "=== Running migration inside VM ==="
-ssh $SSH_OPTS root@localhost "bootc-migrate-composefs --target-image $TARGET_IMAGE --force"
+ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs --target-image $TARGET_IMAGE --force"
 
 echo "=== Rebooting VM ==="
 ssh $SSH_OPTS root@localhost "reboot" || true
