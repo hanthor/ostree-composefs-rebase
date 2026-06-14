@@ -276,15 +276,15 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
             );
             fs::write(entry_path, entry_content)?;
             
-            // Regenerate GRUB config to pick up the new BLS entry
-            println!("Regenerating GRUB configuration...");
-            let _ = Command::new("grub2-mkconfig")
-                .args(["-o", "/boot/grub2/grub.cfg"])
-                .status();
-            // Set the new entry as default for next boot
+            // Set the new entry as default using GRUB environment block
+            // (skip grub2-mkconfig which fails on composefs= kernel options)
+            let entry_id = format!("bootc_bluefin_dakota-{}", verity_hash);
             let _ = Command::new("grub2-set-default")
-                .arg("0")
+                .arg(&entry_id)
                 .status();
+            // Also try setting via savedefault
+            let saved_entry = format!("saved_entry={}\n", entry_id);
+            let _ = fs::write("/boot/grub2/grubenv", saved_entry.as_bytes());
         }
         
         Ok(())
