@@ -54,6 +54,10 @@ pub fn run_migration(report: &PreflightReport, target_image: &str) -> Result<()>
     let _ = Command::new("mount")
         .args(["-o", "remount,rw", "/sysroot"])
         .status();
+    // /boot may also be read-only on OSTree systems
+    let _ = Command::new("mount")
+        .args(["-o", "remount,rw", "/boot"])
+        .status();
 
     println!("=== Phase 1: Importing OSTree objects ===");
     let ostree_repo = "/sysroot/ostree/repo";
