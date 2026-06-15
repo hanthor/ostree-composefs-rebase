@@ -48,10 +48,13 @@ A Bluefin:stable user runs the migration binary once and ends up booted on Dakot
 | `bootc status` fails with "No manifest_digest in origin and no legacy .imginfo file" | Switched to `tini::Ini` for byte-compatible .origin formatting; key `container` → `container-image-reference` (matches `ORIGIN_CONTAINER` constant); added `manifest_digest` to `[boot]` section so bootc can fetch OCI manifest from registry; `patch_origin_boot_digest` computes sha256(vmlinuz || initrd) after Phase 5 extraction | `9abeb0b` |
 | OSTree fallback BLS entry on ESP broke `bootc status` (bootc parses every non-EFI ESP entry as composefs deployment, bails on missing `composefs=` cmdline) | Removed OSTree fallback from ESP entirely; recovery via firmware menu (`Fedora\shimx64.efi`) or GRUB; `build_ostree_fallback_on_esp` kept as `#[allow(dead_code)]` | `9abeb0b` |
 | Origin file schema extractable + testable | Extracted `build_origin_content` + `patch_boot_digest_in_content` as pure functions; 5 unit tests: round-trip through `tini::Ini`, deterministic output, digest replacement, key preservation, garbage-input rejection | `1008766` |
+| sshd 255/EXCEPTION — root cause: `sshd_config.d/40-redhat-crypto-policies.conf` from Bluefin survived merge and references `/etc/crypto-policies/back-ends/opensshserver.config` which doesn't exist in Dakota | Adopted composefs 3-way merge semantic: `(Some(old), Some(cur), None)` with `old==cur` → drop (system file the target removed). This correctly drops Red Hat sshd_config.d files while preserving user-created files (only in cur). Moved e2e-sshd.socket out of Containerfile into live /etc injection so it's user-created and survives merge. | `9027a5f` |
 
-## Current Blocker: sshd-session 255/EXCEPTION on the per-connection socket
+## Current Blocker: E2E verification pending
 
-Composefs boots cleanly now. dbus, polkit, logind, messagebus, NetworkManager, sshd.service all reach `Started` without 217/USER. The post-reboot e2e SSH attempt:
+Composefs boots but post-reboot SSH fails (sshd 255/EXCEPTION). Root cause identified and fixed (`9027a5f`): Bluefin's `sshd_config.d/40-redhat-crypto-policies.conf` survived the 3-way /etc merge and its `Include /etc/crypto-policies/back-ends/opensshserver.config` fails because Dakota doesn't have Red Hat crypto-policies. Fix: composefs merge semantic drops source-only system files when user didn't modify them. E2E running to verify.
+
+### Remaining blocker symptoms (pre-fix reference)
 - Goes through `e2e-sshd.socket` (socket-activated per-connection sshd; the socket is preserved by Phase 4 now)
 - systemd forks `/usr/sbin/sshd -i` as PID 838
 - The session dies 65ms later with `code=exited, status=255/EXCEPTION`
