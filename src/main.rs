@@ -236,7 +236,7 @@ fn main() {
     }
 
     println!("Starting migration to OCI image: {}...", target_image);
-    if let Err(e) = migration::run_migration(&report, &target_image, args.dry_run, args.skip_import, &args.bootloader) {
+    if let Err(e) = migration::run_migration(&report, &target_image, args.dry_run, args.skip_import, &args.bootloader, args.force) {
         eprintln!("\nMigration Failed: {:#}", e);
         process::exit(1);
     }

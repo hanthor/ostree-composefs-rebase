@@ -187,6 +187,112 @@ fn setup_composefs_loopback_if_needed(report: &PreflightReport) -> Result<Option
     }
 }
 
+/// Detect whether LVM volumes are active on the running system.
+fn detect_lvm() -> bool {
+    match fs::read_dir("/dev/mapper") {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy() != "control"),
+        Err(_) => false,
+    }
+}
+
+/// Rebuild the staged initrd with LVM/DM support using the host's dracut and
+/// Dakota's kernel modules from the composefs overlay mount.
+///
+/// Non-fatal: warns if dracut is absent or fails so migration still completes.
+/// The user can rerun dracut manually from the OSTree fallback if the system
+/// fails to boot (see the warning message for the exact command).
+fn rebuild_initrd_with_lvm_if_needed(
+    kver: &str,
+    mount_path: &Path,
+    initrd_dst: &Path,
+) -> Result<()> {
+    if !detect_lvm() {
+        return Ok(());
+    }
+    println!("[phase5] LVM root detected — rebuilding initrd with LVM/DM support...");
+
+    let dracut_path = ["/usr/bin/dracut", "/usr/sbin/dracut", "dracut"]
+        .iter()
+        .find(|&&p| Path::new(p).exists())
+        .copied()
+        .ok_or_else(|| anyhow!(
+            "dracut not found; cannot rebuild initrd for LVM.\n\
+             Manual fix after booting OSTree fallback:\n\
+             dracut --kver {} --add 'lvm dm' --force {}",
+            kver, initrd_dst.display()
+        ))?;
+
+    let modules_src = mount_path.join("usr/lib/modules").join(kver);
+    if !modules_src.exists() {
+        return Err(anyhow!(
+            "Dakota kernel modules not found at {} — \
+             composefs overlay may not be mounted correctly",
+            modules_src.display()
+        ));
+    }
+
+    // Temporarily symlink Dakota's kernel modules at /lib/modules/<kver> so
+    // dracut can find them without copying the full module tree (~400 MB).
+    // On modern Fedora/CentOS, /lib is a symlink to /usr/lib, so this resolves
+    // correctly whether the system uses merged /usr or not.
+    let modules_link = PathBuf::from("/lib/modules").join(kver);
+    let created_link = if !modules_link.exists() {
+        std::os::unix::fs::symlink(&modules_src, &modules_link)
+            .with_context(|| format!(
+                "failed to symlink {} → {}",
+                modules_link.display(), modules_src.display()
+            ))?;
+        println!("[phase5] Linked Dakota kernel modules at {}.", modules_link.display());
+        true
+    } else {
+        println!("[phase5] /lib/modules/{} already exists — using it.", kver);
+        false
+    };
+
+    let status = Command::new(dracut_path)
+        .args([
+            "--kver", kver,
+            "--add", "lvm dm",
+            "--force",
+            initrd_dst.to_str().unwrap_or("/dev/null"),
+        ])
+        .status();
+
+    // Always clean up the symlink, regardless of dracut outcome.
+    if created_link {
+        if let Err(e) = fs::remove_file(&modules_link) {
+            eprintln!("[phase5] Warning: failed to remove module symlink {}: {}", modules_link.display(), e);
+        }
+    }
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("[phase5] LVM-enabled initrd staged at {}.", initrd_dst.display());
+            Ok(())
+        }
+        Ok(s) => {
+            eprintln!(
+                "[phase5] Warning: dracut exited {:?} — initrd may lack LVM support.\n\
+                 If the system fails to boot, select the OSTree fallback entry and run:\n  \
+                 dracut --kver {} --add 'lvm dm' --force {}",
+                s.code(), kver, initrd_dst.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "[phase5] Warning: dracut failed to run ({}) — initrd may lack LVM support.\n\
+                 If the system fails to boot, select the OSTree fallback entry and run:\n  \
+                 dracut --kver {} --add 'lvm dm' --force {}",
+                e, kver, initrd_dst.display()
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Main migration entry point. Orchestrates all 5 phases.
 pub fn run_migration(
     report: &PreflightReport,
@@ -194,6 +300,7 @@ pub fn run_migration(
     dry_run: bool,
     skip_import: bool,
     bootloader: &str,
+    force: bool,
 ) -> Result<()> {
     // Acquire exclusive lock (Fix 8).
     let _lock = if !dry_run {
@@ -268,7 +375,7 @@ pub fn run_migration(
     let _deploy_dir = phase4_stage_deploy(&verity, target_image, &_manifest_digest, &config_digest, dry_run)?;
 
     // ---- Phase 5: Setup bootloader ----
-    phase5_setup_bootloader(report, &verity, target_image, dry_run, bootloader)?;
+    phase5_setup_bootloader(report, &verity, target_image, dry_run, bootloader, force)?;
 
     println!("\n=== MIGRATION COMPLETED ===");
     println!("Staged ComposeFS deployment: {}", verity.as_hex());
@@ -933,6 +1040,7 @@ fn phase5_setup_bootloader(
     target_image: &str,
     dry_run: bool,
     bootloader: &str,
+    force: bool,
 ) -> Result<()> {
     println!("=== Phase 5: Setting Up Bootloader ===");
 
@@ -961,9 +1069,20 @@ fn phase5_setup_bootloader(
             .map(|d| d.filter_map(|e| e.ok())
                  .any(|e| e.file_name().to_string_lossy().starts_with("bootc_")))
             .unwrap_or(false);
-        if has_existing {
+        if has_existing && !force {
             println!("BLS entries already present in {}. Skipping Phase 5.", entries_check.display());
             return Ok(());
+        }
+        if has_existing && force {
+            println!("[phase5] --force: re-running Phase 5 over existing BLS entries.");
+            // Remove existing bootc_ entries so they get cleanly rewritten.
+            if let Ok(rd) = fs::read_dir(&entries_check) {
+                for entry in rd.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with("bootc_") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
         }
     }
 
@@ -1056,6 +1175,15 @@ fn phase5_setup_bootloader(
                 extract_files_via_registry(target_image, &extract)
                     .context("failed to extract kernel/initrd from target image via registry stream")?;
 
+                // Rebuild initrd with LVM support if the source system uses LVM.
+                // Must happen before patch_origin_boot_digest so the hash covers
+                // the LVM-enabled initrd bytes, not the original Dakota initrd.
+                if have_initrd {
+                    if let Err(e) = rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &esp_initrd) {
+                        eprintln!("[phase5] Warning: LVM initrd rebuild failed: {e:#}");
+                    }
+                }
+
                 // Now that vmlinuz + initrd are on the ESP, compute their
                 // boot_digest (sha256(vmlinuz || initrd)) and patch the .origin
                 // file. `bootc status` requires this digest to set soft-reboot
@@ -1139,6 +1267,10 @@ fn phase5_setup_bootloader(
         fs::copy(&vmlinuz_src, grub_boot_dir.join("vmlinuz"))?;
         if initrd_src.exists() {
             fs::copy(&initrd_src, grub_boot_dir.join("initrd"))?;
+            let grub_initrd = grub_boot_dir.join("initrd");
+            if let Err(e) = rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &grub_initrd) {
+                eprintln!("[phase5] Warning: LVM initrd rebuild failed: {e:#}");
+            }
         }
 
         // Composefs entry (priority 1) — #8
