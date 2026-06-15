@@ -126,6 +126,16 @@ pub fn copy_dir_all_with_xattrs(src: impl AsRef<Path>, dst: impl AsRef<Path>) ->
     let src = src.as_ref();
     let dst = dst.as_ref();
     fs::create_dir_all(dst)?;
+    // Preserve directory mode (umask would otherwise mask it to 755, which
+    // breaks sshd StrictModes on dirs like /root/.ssh that must be 700).
+    let src_meta = fs::metadata(src)?;
+    let src_mode = unix_fs::PermissionsExt::mode(&src_meta.permissions());
+    let mut dst_perms = fs::metadata(dst)?.permissions();
+    unix_fs::PermissionsExt::set_mode(&mut dst_perms, src_mode);
+    fs::set_permissions(dst, dst_perms)?;
+    if let Some(s) = src.to_str() {
+        let _ = copy_xattrs(s, dst);
+    }
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
@@ -218,6 +228,27 @@ mod tests {
         assert!(dst_dir.join("real.txt").exists());
         let link_target = fs::read_link(dst_dir.join("link.txt")).unwrap();
         assert_eq!(link_target.to_string_lossy(), "real.txt");
+    }
+
+    #[test]
+    fn copy_dir_all_with_xattrs_preserves_directory_mode() {
+        // Regression: sshd StrictModes rejects authorized_keys when its parent
+        // .ssh dir is anything looser than 700. The recursive copy must
+        // propagate the source dir mode rather than inheriting umask 022.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        let dst_dir = dir.path().join("dst");
+        let ssh = src_dir.join(".ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(ssh.join("authorized_keys"), b"ssh-rsa AAA").unwrap();
+
+        copy_dir_all_with_xattrs(&src_dir, &dst_dir).unwrap();
+
+        let dst_ssh_mode = fs::metadata(dst_dir.join(".ssh")).unwrap().permissions().mode();
+        assert_eq!(dst_ssh_mode & 0o777, 0o700, "dst .ssh must stay 700, got {:o}", dst_ssh_mode & 0o777);
     }
 
     #[test]

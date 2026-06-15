@@ -442,67 +442,14 @@ fn phase4_var_migration(etc_dir: &Path, _dry_run: bool) -> Result<()> {
         }
     }
 
-    // Check if /var is a separate btrfs subvol (#7)
-    let mounts = fs::read_to_string("/proc/mounts")?;
-    let var_is_subvol = mounts.lines().any(|line| {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        parts.len() >= 3 && parts[1] == "/var" && parts[2] == "btrfs"
-    });
+    // Always copy /var data into state/os/default/var so the bootc initramfs
+    // bind-mount of that path onto the deploy's /var exposes user data
+    // (roothome/.ssh, home/, lib/containers, etc.). Do NOT synthesize an
+    // /etc/fstab entry for /var: on Bluefin /proc/mounts reports /var as
+    // subvolid=5 (the root subvol), and mounting that at /var post-pivot
+    // shadows the bind-mount with /ostree, /state, /boot — losing user data.
+    let _ = etc_dir; // (kept for signature compat; no fstab edits anymore)
 
-    if var_is_subvol {
-        println!("Preserving Btrfs 'var' subvolume mount.");
-        // bootc-root-setup in the initramfs bind-mounts state/os/default/var onto the
-        // pivoted root's /var; if the source path doesn't exist it bails into emergency
-        // mode. We create the dir as a fallback bind target, then write a fstab entry
-        // that mounts the actual btrfs subvol over /var post-pivot so user data appears.
-        if let Err(e) = fs::create_dir_all(target_var) {
-            eprintln!(
-                "Warning: failed to create {} for initramfs var bind-mount target: {}",
-                target_var.display(),
-                e
-            );
-        }
-
-        let synthesized = synthesize_var_fstab_entry(&mounts);
-        let mut new_fstab_lines = String::new();
-        if let Ok(fstab_content) = fs::read_to_string("/etc/fstab") {
-            for line in fstab_content.lines() {
-                if line.contains("/var") && !line.trim_start().starts_with('#') {
-                    new_fstab_lines.push_str(line);
-                    new_fstab_lines.push('\n');
-                }
-            }
-        }
-        if new_fstab_lines.is_empty() {
-            if let Some(line) = synthesized {
-                println!("Synthesized /var fstab entry: {}", line.trim_end());
-                new_fstab_lines.push_str(&line);
-            } else {
-                eprintln!(
-                    "Warning: could not synthesize fstab entry for /var subvol — /var may appear empty after pivot."
-                );
-            }
-        }
-        if !new_fstab_lines.is_empty() {
-            let new_fstab_path = etc_dir.join("fstab");
-            let existing = fs::read_to_string(&new_fstab_path).unwrap_or_default();
-            let combined = if existing.is_empty() {
-                new_fstab_lines
-            } else {
-                format!("{}\n{}", existing.trim_end(), new_fstab_lines)
-            };
-            if let Err(e) = fs::write(&new_fstab_path, &combined) {
-                eprintln!(
-                    "Warning: failed to write etc/fstab with var subvol entry ({}): {}",
-                    new_fstab_path.display(), e
-                );
-            }
-        }
-        println!("/var is on a separate Btrfs subvolume — data stays in place.");
-        return Ok(());
-    }
-
-    // /var is not a separate mount — migrate data
     if !target_var.exists() {
         fs::create_dir_all(target_var.parent().unwrap())?;
     }
@@ -523,6 +470,7 @@ fn phase4_var_migration(etc_dir: &Path, _dry_run: bool) -> Result<()> {
 
 /// Build a fstab entry for the /var btrfs subvolume by parsing /proc/mounts and
 /// resolving the source device to a UUID. Returns None if the data can't be derived.
+#[allow(dead_code)]
 fn synthesize_var_fstab_entry(mounts: &str) -> Option<String> {
     let var_line = mounts.lines().find(|line| {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -549,6 +497,7 @@ fn synthesize_var_fstab_entry(mounts: &str) -> Option<String> {
     Some(format!("{}\t/var\tbtrfs\t{}\t0 0\n", source, opts))
 }
 
+#[allow(dead_code)]
 fn resolve_device_uuid(device: &str) -> Option<String> {
     let by_uuid = Path::new("/dev/disk/by-uuid");
     let entries = fs::read_dir(by_uuid).ok()?;
@@ -651,7 +600,7 @@ fn ensure_e2e_ssh_socket(etc_dir: &Path) -> Result<()> {
     )?;
     fs::write(
         systemd_dir.join("e2e-sshd@.service"),
-        "[Unit]\nDescription=E2E SSH per-connection service\n[Service]\nExecStart=-/bin/sh -c 'echo SSH-START >>/etc/ssh-debug.log 2>&1; /usr/bin/sshd -i 2>>/etc/ssh-debug.log; echo SSH-EXIT-CODE=$? >>/etc/ssh-debug.log'\nStandardInput=socket\n",
+        "[Unit]\nDescription=E2E SSH per-connection service\n[Service]\nExecStart=-/usr/bin/sshd -i -E /var/log/sshd-e2e.log -d\nStandardInput=socket\n",
     )?;
 
     let symlink = systemd_dir.join("sockets.target.wants/e2e-sshd.socket");

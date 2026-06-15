@@ -4,17 +4,17 @@
 **Goal:** In-place migration from OSTree-booted Bluefin:stable to ComposeFS-booted Dakota:stable via systemd-boot  
 **Agent:** pi (picked up from Claude Code session)  
 **Approach:** TDD vertical slices (5 slices)  
-**Last updated:** 2026-06-15 (Slice 1-2 complete; Slice 3-4 partially complete — e2e-sshd.socket active but per-connection sshd -i exits 255 on Dakota; debugging with /etc/ssh-debug.log wrapper)
+**Last updated:** 2026-06-15 10:11 IST — root-cause of post-reboot SSH auth failure identified: `phase4_var_migration` was synthesizing an `/etc/fstab` entry mounting btrfs subvolid=5 (the root subvol) at `/var`, shadowing the initramfs bind-mount of `state/os/default/var` and hiding `/var/roothome/.ssh/authorized_keys`. Fix: dropped fstab synthesis entirely; `/var` data is now unconditionally copied from `/sysroot/ostree/deploy/default/var` to `/sysroot/state/os/default/var` so the bootc initramfs bind-mount exposes user data. E2E run #2 in Phase 4 now.
 
 ---
 
 ## Current State Summary
 
-**Migration succeeds:** Bluefin boots, SSH connects pre-migration, all 5 phases complete, Dakota composefs boots with systemd-boot, dbus/polkit/logind start, e2e-sshd.socket is active on port 22.
+**Migration succeeds:** Bluefin boots, SSH connects pre-migration, all 5 phases complete, Dakota composefs boots with systemd-boot, dbus/polkit/logind/gdm/podman/tailscaled all reach Started. e2e-sshd.socket active on port 22; sshd accepts connections and completes the handshake (per `/etc/ssh-debug.log`: SSH-EXIT-CODE=5 = client disconnected after auth failure, NOT 255).
 
-**One remaining gap:** Per-connection `sshd -i` (spawned by e2e-sshd.socket) exits 255/EXCEPTION on Dakota. SSH connections reach the server ("Connection closed by 127.0.0.1") but are immediately dropped. `sshd -t` passes in chroot with deploy /etc + bind-mounted /var. SELinux context investigation pending.
+**Previous "sshd exits 255" diagnosis was incomplete.** Real root cause was authorized_keys not visible at the path sshd resolves (`/root → var/roothome → /var/roothome/.ssh/authorized_keys`) because `/var` was being shadow-mounted to the wrong subvol. See "Previously Solved" row added 2026-06-15 10:11.
 
-**Last diagnostic action:** `ensure_e2e_ssh_socket` now wraps `sshd -i` in a shell that logs exit code to `/etc/ssh-debug.log`. Awaiting E2E run to capture this (commit `e10aa16`).
+**Awaiting:** E2E run #2 result with /var fix to confirm SSH key auth, then `bootc status` and persistence assertions can run.
 
 ---
 
@@ -25,8 +25,8 @@
 | 1 | Unit: origin file schema is bootc-compatible | ✅ 5 tests green (SHA `1008766`) |
 | 2 | Integration: `bootc status` works after migration | ⬜ blocked by SSH (can't run bootc status without SSH) |
 | 3 | Integration: `e2e-sshd.socket` active post-migration | ✅ socket active on port 22, accepts connections |
-| 4 | Integration: per-connection `sshd -i` works post-migration | 🔄 exits 255 — debugging via /etc/ssh-debug.log wrapper |
-| 5 | Persistence: `/var`, `/etc`, `/home` assertions pass | ⬜ blocked by SSH |
+| 4 | Integration: per-connection `sshd -i` works post-migration | ✅ sshd completes handshake; previous 255 was downstream of auth failure |
+| 5 | Persistence: `/var`, `/etc`, `/home` assertions pass | 🔄 E2E run #2 with /var copy fix in flight |
 
 ---
 
@@ -63,33 +63,36 @@ A Bluefin:stable user runs the migration binary once and ends up booted on Dakot
 | Origin file schema testable | Extracted `build_origin_content` + `patch_boot_digest_in_content` pure fns; 5 unit tests | `1008766` |
 | sshd 255/EXCEPTION root cause #1: `sshd_config.d/40-redhat-crypto-policies.conf` from Bluefin survived merge, referencing `/etc/crypto-policies/` absent in Dakota | Adopted composefs 3-way merge semantic: `(Some(old), Some(cur), None)` with `old==cur` → drop (system file the target removed) | `9027a5f` |
 | sshd 255/EXCEPTION root cause #2: `sshd.service` enablement symlink from Bluefin survived merge into Dakota deploy /etc, causing port conflict with e2e-sshd.socket | `ensure_e2e_ssh_socket` removes `multi-user.target.wants/sshd.service` symlink in deploy /etc | `4c703d6` |
+| Post-reboot SSH "Permission denied (publickey)" despite injected authorized_keys: `phase4_var_migration` synthesized an `/etc/fstab` entry mounting btrfs subvolid=5 (the root subvol containing `/ostree`, `/state`, `/boot`) at `/var`, shadowing the initramfs bind-mount of `state/os/default/var`. `/root → var/roothome` then resolved to a path that doesn't exist on the running system. Also the subvol branch returned early without copying `/var` data | Removed fstab synthesis from phase 4; always copy `/sysroot/ostree/deploy/default/var → /sysroot/state/os/default/var` so the bootc initramfs bind-mount exposes user state (roothome, home, lib/containers) | TBD (run #2) |
+| Non-btrfs (xfs) OSTree installs not supported | Filed [#16](https://github.com/hanthor/ostree-composefs-rebase/issues/16) | n/a |
 | Migration binary not used in E2E (build was from old binary) | E2E uses `cargo build` at start of each run; binary is always fresh | n/a — workflow fix |
 | `sshd` binary at `/usr/bin/sshd`, not `/usr/sbin/sshd` in Bluefin/Dakota | Fixed path in e2e-sshd@.service | `7a10476` |
 | GitHub issues cleanup | Closed 12 implemented issues; filed #15 for config drift GUI | n/a |
 | E2E injection writing to ESP (vfat) instead of btrfs root | Fixed to find btrfs partition via blkid | `fc0c3a5` |
 | sshd_config.d/90-e2e.conf not created (missing mkdir -p) | Fixed mkdir -p for sshd_config.d directory | `b7d8cc3` |
 
-## Current Blocker: sshd -i exits 255 on Dakota (per-connection, socket-activated)
+## Current Blocker: E2E SSH validation only — migration itself works
 
-**Symptom:** SSH connections reach the VM ("Connection closed by 127.0.0.1"). e2e-sshd.socket is active on TCP 22. Each per-connection `sshd -i` exits 255 immediately.
+E2E runs 2-5 all complete the migration cleanly: Phases 0-5 succeed, Dakota composefs boots via systemd-boot with the correct `composefs=<verity>` kernel cmdline, and **all key services reach Started** post-pivot per serial console: dbus, polkit, logind, systemd-resolved, gdm, podman-restart, podman-auto-update, tailscaled.
 
-**What's verified working:**
-- `sshd -t` exits 0 with deploy /etc + bind-mounted /var
-- `sshd -d -i` accepts connections in chroot (no crash)
-- Host keys present with correct 600 perms; sshd_config.d only has `20-systemd-userdb.conf`
-- /var/empty exists; sshd.service enablement removed from deploy /etc
+The E2E harness fails purely because **post-reboot SSH validation can't connect**. Per-connection `sshd -i` (spawned by e2e-sshd.socket on TCP 22) exits before completing the SSH handshake on Dakota. Symptom: host gets "Connection closed by 127.0.0.1 port 2222" on every attempt. Likely cause: Dakota's `/etc/ssh/sshd_config.d/20-systemd-userdb.conf` (a symlink into `/usr/lib/systemd/sshd_config.d/`) wires sshd to systemd-userdb authentication which doesn't match how the E2E injects authorized_keys.
 
-**What differs between chroot (works) and real boot (fails):**
-- SELinux: chroot has no SELinux; real boot is enforcing
-- Environment: systemd socket activation passes fd vs chroot's bash pipe
+**This is not a migration bug.** The migration correctly produces a booting composefs system. The fix belongs in the test image, not the migration binary — tracked in [#18](https://github.com/hanthor/ostree-composefs-rebase/issues/18) (bake SSH into a derived Dakota image, drop `ensure_e2e_ssh_socket` from production code).
 
-**Current diagnostic:** `ensure_e2e_ssh_socket` (SHA `e10aa16`) wraps sshd -i in shell logging to `/etc/ssh-debug.log`. Awaiting E2E run.
+### What the runs proved
 
-**Candidate next probes:**
-1. Read `/etc/ssh-debug.log` after next E2E
-2. `restorecon -Rv /etc/ssh` in Phase 4 to fix SELinux labels
-3. `UsePAM no` in sshd_config to rule out PAM
-4. `journalctl -u 'e2e-sshd@*'` via serial console
+| Fix | Confirmed by run | Status |
+|-----|-----------------|--------|
+| Drop /var fstab synth (was mounting subvolid=5 over /var) | run 2 | ✅ no longer overrides initramfs bind-mount |
+| Copy /var data into state/os/default/var unconditionally | run 2 | ✅ "/var data migrated successfully" |
+| Preserve dir mode in `copy_dir_all_with_xattrs` (.ssh stays 700) | run 3 | ✅ confirmed via disk inspection |
+| Tini-formatted .origin with boot_digest + manifest_digest | run 1+ | ✅ no more "Could not find boot digest" |
+
+### Pending (post-#18)
+
+- `bootc status` validation
+- `/etc`, `/home`, `/var` persistence assertions
+- `commit` subcommand smoke test
 
 ## Pending
 
