@@ -313,7 +313,7 @@ sudo tee "$ETC_SYSTEMD/e2e-sshd@.service" >/dev/null <<'SERVICEEOF'
 [Unit]
 Description=E2E SSH per-connection service
 [Service]
-ExecStart=-/usr/sbin/sshd -i
+ExecStart=-/usr/bin/sshd -i
 StandardInput=socket
 SERVICEEOF
 sudo ln -sf ../e2e-sshd.socket \
