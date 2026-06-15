@@ -233,27 +233,31 @@ fn rebuild_initrd_with_lvm_if_needed(
         ));
     }
 
-    // Temporarily symlink Dakota's kernel modules at /lib/modules/<kver> so
-    // dracut can find them without copying the full module tree (~400 MB).
-    // On modern Fedora/CentOS, /lib is a symlink to /usr/lib, so this resolves
-    // correctly whether the system uses merged /usr or not.
-    let modules_link = PathBuf::from("/lib/modules").join(kver);
-    let created_link = if !modules_link.exists() {
-        std::os::unix::fs::symlink(&modules_src, &modules_link)
-            .with_context(|| format!(
-                "failed to symlink {} → {}",
-                modules_link.display(), modules_src.display()
-            ))?;
+    // Symlink Dakota's kernel modules into /var/tmp (always writable) so dracut
+    // can find them. /lib/modules is read-only on OSTree deployments because
+    // /lib → /usr/lib is part of the immutable OSTree image.
+    let modules_link = PathBuf::from("/var/tmp").join(format!("bootc-kmod-{}", kver));
+    if modules_link.exists() || modules_link.is_symlink() {
+        let _ = fs::remove_file(&modules_link);
+    }
+    let created_link = std::os::unix::fs::symlink(&modules_src, &modules_link)
+        .with_context(|| format!(
+            "failed to symlink {} → {}",
+            modules_link.display(), modules_src.display()
+        ))
+        .map(|_| true)
+        .unwrap_or_else(|e| {
+            eprintln!("[phase5] Warning: could not create module symlink: {e}");
+            false
+        });
+    if created_link {
         println!("[phase5] Linked Dakota kernel modules at {}.", modules_link.display());
-        true
-    } else {
-        println!("[phase5] /lib/modules/{} already exists — using it.", kver);
-        false
-    };
+    }
 
     let status = Command::new(dracut_path)
         .args([
             "--kver", kver,
+            "--kmoddir", modules_link.to_str().unwrap_or("/dev/null"),
             "--add", "lvm dm",
             "--force",
             initrd_dst.to_str().unwrap_or("/dev/null"),
@@ -1264,10 +1268,32 @@ fn phase5_setup_bootloader(
         let boot_dir_name = format!("bootc_composefs-{}", verity.as_hex());
         let grub_boot_dir = Path::new("/boot").join(&boot_dir_name);
         fs::create_dir_all(&grub_boot_dir)?;
-        fs::copy(&vmlinuz_src, grub_boot_dir.join("vmlinuz"))?;
+
+        // Use registry stream for vmlinuz + initrd — copying from the raw EROFS mount
+        // zero-fills content past the inline threshold, producing a corrupt 192MB initrd.
+        let rel_vmlinuz = vmlinuz_src.strip_prefix(&mount_path)
+            .with_context(|| format!("vmlinuz {:?} not under mount", vmlinuz_src))?;
+        let in_container_vmlinuz = Path::new("/").join(rel_vmlinuz);
+        let grub_vmlinuz = grub_boot_dir.join("vmlinuz");
+        let mut grub_extract: Vec<(PathBuf, PathBuf)> = vec![
+            (in_container_vmlinuz, grub_vmlinuz.clone()),
+        ];
+        let grub_initrd = grub_boot_dir.join("initrd");
+        let mut have_grub_initrd = false;
         if initrd_src.exists() {
-            fs::copy(&initrd_src, grub_boot_dir.join("initrd"))?;
-            let grub_initrd = grub_boot_dir.join("initrd");
+            let rel_initrd = initrd_src.strip_prefix(&mount_path)
+                .with_context(|| format!("initrd {:?} not under mount", initrd_src))?;
+            let in_container_initrd = Path::new("/").join(rel_initrd);
+            grub_extract.push((in_container_initrd, grub_initrd.clone()));
+            have_grub_initrd = true;
+        }
+        let extract_pairs: Vec<(&Path, &Path)> = grub_extract.iter()
+            .map(|(s, d)| (s.as_path(), d.as_path()))
+            .collect();
+        extract_files_via_registry(target_image, &extract_pairs)
+            .context("failed to extract kernel/initrd from target image via registry stream (GRUB2 path)")?;
+
+        if have_grub_initrd {
             if let Err(e) = rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &grub_initrd) {
                 eprintln!("[phase5] Warning: LVM initrd rebuild failed: {e:#}");
             }
