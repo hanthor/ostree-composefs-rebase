@@ -291,7 +291,7 @@ sudo chown -R 0:0 "$ROOT_SSH_DIR"
 
 # Ensure SSH permits root login (already in derived image, but double-check)
 SSHD_CONFIG_DIR="$MNT_DIR/ostree/deploy/default/var/etc/ssh"
-sudo mkdir -p "$SSHD_CONFIG_DIR"
+sudo mkdir -p "$SSHD_CONFIG_DIR/sshd_config.d"
 echo "PermitRootLogin yes" | sudo tee "$SSHD_CONFIG_DIR/sshd_config.d/90-e2e.conf" >/dev/null 2>&1 || true
 
 # Add e2e-sshd.socket for TCP 22 (Bluefin's sshd only binds Unix-local + vsock).
@@ -626,7 +626,7 @@ TAIL_PID=$!
 ATTEMPT=1
 WAIT_START=$SECONDS
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-    if ssh $SSH_OPTS root@localhost true 2>/dev/null; then
+    if ssh $SSH_OPTS root@localhost true 2>&1; then
         step "VM accessible via SSH after reboot ($((SECONDS - WAIT_START))s)."
         kill "$TAIL_PID" 2>/dev/null || true
         TAIL_PID=""
