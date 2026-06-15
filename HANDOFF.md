@@ -2,7 +2,21 @@
 
 **Repository:** `hanthor/ostree-composefs-rebase`  
 **Goal:** In-place migration from OSTree-booted Bluefin:stable to ComposeFS-booted Dakota:stable via systemd-boot  
-**Last updated:** 2026-06-14 (EROFS+podman content corruption still open)  
+**Agent:** pi (picked up from Claude Code session)  
+**Approach:** TDD vertical slices (5 slices total)  
+**Last updated:** 2026-06-15 (Slice 1 complete — origin schema unit tests green; Slice 2 E2E running)  
+
+---
+
+## TDD Slice Plan
+
+| # | Slice | Status |
+|---|-------|--------|
+| 1 | Unit: origin file schema is bootc-compatible (round-trip, digest patch, key preservation) | ✅ 5 tests green (SHA `1008766`) |
+| 2 | Integration: `bootc status` works after migration (no "No manifest_digest" or "Could not find boot digest") | 🔄 E2E running |
+| 3 | Integration: `e2e-sshd.socket` active post-migration | ⬜ |
+| 4 | Integration: `sshd.service` starts without 255/EXCEPTION | ⬜ |
+| 5 | Persistence: `/var`, `/etc`, `/home` assertions pass | ⬜ |
 
 ---
 
@@ -13,7 +27,8 @@ A Bluefin:stable user runs the migration binary once and ends up booted on Dakot
 ## What Works
 
 - Phase 0 free-space check, Phase 1 OSTree import (skippable), Phase 2 OCI pull, Phase 3 EROFS seal (idempotent), Phase 4 /etc 3-way merge / .origin / .imginfo / /var handling, Phase 5 bootloader staging (BLS entries + loader.conf + efibootmgr NVRAM registration).
-- systemd-boot BLS entry shows up in the loader menu and is selected as default; OSTree fallback is also presented.
+- `.origin` file uses `tini::Ini` for byte-compatible formatting with bootc's parser; includes `container-image-reference`, `boot_type=bls`, placeholder `boot_digest` (patched in Phase 5 with real sha256(vmlinuz||initrd)), and `manifest_digest`.
+- systemd-boot BLS entry shows up in the loader menu and is selected as default; recovery via firmware menu or GRUB (no fallback BLS on ESP to avoid breaking `bootc status`).
 
 ## Previously Solved
 
@@ -24,35 +39,55 @@ A Bluefin:stable user runs the migration binary once and ends up booted on Dakot
 | Required systemd-boot package on source (Bluefin) OS | Phase 5 sources `systemd-bootx64.efi` from the target image; efibootmgr registers `Linux Boot Manager` | e0b543f |
 | Raw EROFS mount returned zero-filled content past inline threshold | Tried `bootc internals cfs oci mount` first (commit `7abda35`) — but it fails because the pull flow doesn't populate `streams/oci-config-<verity>` ref; fell back to broken EROFS path silently | 7abda35 |
 | EROFS-corrupted vmlinuz+initrd+sd-boot still ending up on ESP/boot | Switched to `podman create` + `podman cp` to extract real bytes from target image (commit `76628a4`) — but podman pull blew the VM's disk (ENOSPC in `/var/lib/containers/storage`) so extraction failed and migration fell back to GRUB2 with corrupt boot artifacts | 76628a4 |
+| Extraction fills disk | Phase 5 now streams OCI layers one-at-a-time from registry via skopeo, extracting boot artifacts directly from compressed tarballs. No overlay expansion, ~1-2 GB footprint | 81c7781 |
+| /var fstab synthesis fails when /proc/mounts shows subvolid= instead of subvol= | Fall back to subvolid=, default to subvol=/ if neither present; add diagnostic logging of /proc/mounts line | 468c8eb |
+| Previously assumed: "raw EROFS kernel mount zero-fills out-of-line data" — WRONG. EROFS being metadata-only is by design; the composefs overlay supplies content. The overlay was working all along | n/a — diagnosis retracted | TBD |
+| dbus.service / polkit / logind cascade-fail post-reboot — real root cause: 3-way /etc merge brought forward Bluefin's enablement symlinks; many point to units that don't exist in Dakota (`dbus.service → /usr/lib/systemd/system/dbus-broker.service` — Dakota uses classic dbus). 102 dangling /etc symlinks total, ~30 in /etc/systemd/system | Added `prune_dangling_usr_symlinks` to mergetc.rs; Phase 4 walks merged /etc after merge and drops symlinks whose `/usr/*` target is absent in the target image | TBD |
+| /etc/passwd, /etc/shadow, /etc/group, /etc/gshadow, /etc/subuid, /etc/subgid, /etc/machine-id were getting replaced by Dakota's factory copies (~3 lines, missing messagebus/polkitd/systemd-resolve/etc). Because Bluefin's /usr/etc/passwd matches /etc/passwd on a freshly installed system, the standard 3-way rule (`old==cur, take new`) selected Dakota's near-empty file. Result: dbus/polkit/systemd-resolve/sshd all 217/USER at start | Added `is_identity_db` check in mergetc (line-union by first colon), and replaced the EROFS-mount-based `new_default_etc` source with a registry-streamed `/etc` tree (`extract_subtree_via_registry`). Identity DBs now line-merge against Dakota's actual content, not zero-fill. Phase 4 logs `streamed target /etc from registry for merge source` | TBD |
+| Cross-image migration silently dropped source-only files (e2e-sshd.socket, flatpak-nuke-fedora.service, etc.) when source factory ≡ live ≡ target=absent. Standard OSTree upgrade rule "if old==cur and new==None, drop" assumes same-image upgrades; for cross-image migration it deletes legitimate state | Changed file merge arm `(Some(_), Some(cur), None) => Some(cur)` — keep cur. Old test renamed and assertion flipped; new test `merge_keeps_source_only_unit_when_target_lacks_it` guards the e2e-sshd.socket case | TBD |
+| `bootc status` fails with "No manifest_digest in origin and no legacy .imginfo file" | Switched to `tini::Ini` for byte-compatible .origin formatting; key `container` → `container-image-reference` (matches `ORIGIN_CONTAINER` constant); added `manifest_digest` to `[boot]` section so bootc can fetch OCI manifest from registry; `patch_origin_boot_digest` computes sha256(vmlinuz || initrd) after Phase 5 extraction | `9abeb0b` |
+| OSTree fallback BLS entry on ESP broke `bootc status` (bootc parses every non-EFI ESP entry as composefs deployment, bails on missing `composefs=` cmdline) | Removed OSTree fallback from ESP entirely; recovery via firmware menu (`Fedora\shimx64.efi`) or GRUB; `build_ostree_fallback_on_esp` kept as `#[allow(dead_code)]` | `9abeb0b` |
+| Origin file schema extractable + testable | Extracted `build_origin_content` + `patch_boot_digest_in_content` as pure functions; 5 unit tests: round-trip through `tini::Ini`, deterministic output, digest replacement, key preservation, garbage-input rejection | `1008766` |
 
-## Current Blocker: extract boot binaries from target image without filling the disk
+## Current Blocker: sshd-session 255/EXCEPTION on the per-connection socket
 
-The target image is already on disk twice (sealed EROFS at `/sysroot/composefs/images/<verity>` and pull artifacts at `/sysroot/composefs/streams/…`), but no straightforward tool reads it back:
-- Raw `mount -t erofs -o ro,loop` returns metadata-only views (zero-filled file content past inline threshold).
-- `bootc internals cfs --system oci mount <verity>` fails: `Opening ref 'streams/oci-config-<verity>': No such file or directory` — bootc looks for an OCI-config stream keyed by the EROFS verity, which our pull doesn't create.
-- `podman pull <target>` works but needs ~5 GB of overlay storage just to extract three files; busted the 11.5 GB free space in the VM during the last run.
-- `mount.composefs` / `composefs-info` are not installed on Bluefin.
+Composefs boots cleanly now. dbus, polkit, logind, messagebus, NetworkManager, sshd.service all reach `Started` without 217/USER. The post-reboot e2e SSH attempt:
+- Goes through `e2e-sshd.socket` (socket-activated per-connection sshd; the socket is preserved by Phase 4 now)
+- systemd forks `/usr/sbin/sshd -i` as PID 838
+- The session dies 65ms later with `code=exited, status=255/EXCEPTION`
+- No protocol error visible in qemu.log — sshd's own stderr goes to journal which serial doesn't capture
 
-### Next candidate fixes (ranked)
+What's verified intact in `/sysroot/state/deploy/<verity>/etc/`:
+- `passwd` has root, sshd (privsep), messagebus, polkitd, every Dakota system user (line-merged)
+- `ssh/ssh_host_{rsa,ecdsa,ed25519}_key` present
+- `ssh/sshd_config` is Dakota's (file merge picked it)
+- `pam.d/sshd` → `password-auth` → `/etc/authselect/password-auth` (target exists, 1272 bytes)
+- `/var/roothome/.ssh/authorized_keys` 567 B with the freshly reseeded test key
 
-1. **Skopeo to `dir:` then stream-extract specific files from layer tarballs.** `skopeo copy --src-tls-verify=false docker://… dir:/tmp/oci` writes raw layer tarballs (compressed) without overlay-storage expansion. Walk layers newest-first; for each, `tar -xzf - <path>` looking for `usr/lib/systemd/boot/efi/systemd-bootx64.efi`, `usr/lib/modules/<kver>/vmlinuz`, `usr/lib/modules/<kver>/initramfs.img`. Stop at first hit per file. Compressed layer footprint is ~1–2 GB total, no overlay unpack.
-2. **`bootc image copy-to-storage` equivalent.** Investigate whether bootc has a CLI for "give me a file out of an already-pulled OCI image" — would avoid the second download entirely.
-3. **In-tree EROFS parser.** Open `/sysroot/composefs/images/<verity>`, walk inodes, resolve content sha256, read from `/sysroot/composefs/objects/<sha[:2]>/<sha[2:]>`. Adds a real dependency (`erofs` crate or hand-rolled parser).
+Candidate next probes:
+1. **Capture sshd's actual stderr** — add `Environment=SSH_DEBUG=1` or run `/usr/sbin/sshd -d -i` in `e2e-sshd@.service`'s ExecStart, redirect to console.
+2. **PAM stack** — `/etc/pam.d/password-auth` is a symlink to `/etc/authselect/password-auth`; verify the authselect contents reference modules Dakota ships (e.g. `pam_sss.so` might be present in Bluefin's authselect but Dakota lacks libsss; sshd would 255 on PAM init failure).
+3. **/etc/security/limits.conf, /etc/login.defs** — sshd-session may fail early if these reference missing config.
+4. **NSS plugin libraries** — `/etc/authselect/nsswitch.conf` references `altfiles systemd`; if Dakota's glibc doesn't ship the `altfiles` NSS module, every NSS lookup short-circuits.
 
-### Diagnostics to run on next E2E
+### How the real bug was confirmed (this session)
+- Loopback-mounted `disk.raw` post-migration → EROFS at `composefs/images/<verity>` has dbus.service zero-filled (444B). This is **expected**: the EROFS holds only metadata; `trusted.overlay.metacopy` + `trusted.overlay.redirect` xattrs point to content objects in `composefs/objects/`.
+- Confirmed fs-verity is enabled on btrfs filesystem (`compat_ro_flags = VERITY`), enabled on the EROFS image and on content objects (lsattr shows `V` flag).
+- Mounted the composefs overlay on the host with `bootc internals cfs --repo /var/mnt/diskraw/composefs mount <verity> /tmp/cfs-mount` — `composefs:<hash>` overlay mounted successfully; `head dbus.service` shows real content. So composefs works on this kernel.
+- qemu.log shows `initramfs-setup` exited 0 successfully, and EROFS mount line corresponds to the composefs internal lowerdir mount.
+- The failing units are exactly those whose enablement symlinks point to Dakota-absent /usr targets:
+  - `/etc/systemd/system/dbus.service -> /usr/lib/systemd/system/dbus-broker.service` (Dakota lacks dbus-broker)
+  - `/etc/systemd/system/multi-user.target.wants/{chronyd,sssd,smartd,thermald,tuned,lm_sensors,nfs-client,…}.service` (similar)
+- Each dangling symlink yields `Failed to load configuration: No such file or directory`; the dbus one cascades through polkit → logind → sshd, killing post-reboot SSH.
 
-- Inside VM pre-extraction: `ls /sysroot/composefs/`, `ls /sysroot/composefs/streams/ 2>/dev/null`, `df -h /var/lib/containers /sysroot`. Confirms what bootc actually persisted vs what podman/skopeo would need to re-download.
-- After extraction: `md5sum <esp>/EFI/systemd/systemd-bootx64.efi <esp>/EFI/Linux/bootc_composefs-*/vmlinuz` and compare to the same files extracted by `podman cp` directly on the host — sanity-check we got real content.
+## Pending
 
-## Recently Tried (and why it failed)
-
-- `bootc internals cfs --system oci mount` (7abda35) — preferred over raw EROFS, but errors out with missing `streams/oci-config-<verity>` ref.
-- `podman create` + `podman cp` (76628a4) — pulls correct bytes but ENOSPC when the second image copy doesn't fit on the VM's overlay store. Will work on a bigger disk; not viable for tight VMs.
-
-## Pending (after extraction is solved)
-
-- Realistic user setup in E2E (primary user via useradd, gnome-initial-setup-done, dconf, ~/.config) seeded pre-migration and asserted post-reboot.
-- `--post-hook-dir` flag (default `/etc/bootc-migrate-composefs/post-migrate.d`) for migration-specific cleanup like ublue-motd. Hooks get env: `COMPOSEFS_VERITY`, `TARGET_IMAGE`, `ESP_PATH`, `BOOTLOADER`.
+- **Slice 2**: E2E verify `bootc status` works post-migration (no "No manifest_digest" error). E2E currently running.
+- **Slice 3**: E2E verify `e2e-sshd.socket` active post-migration.
+- **Slice 4**: Debug sshd.service 255/EXCEPTION on Dakota boot.
+- **Slice 5**: Full /var, /etc, /home persistence assertions.
+- Realistic user setup in E2E (primary user via useradd, gnome-initial-setup-done, dconf, ~/.config).
+- `--post-hook-dir` flag (default `/etc/bootc-migrate-composefs/post-migrate.d`) for migration-specific cleanup like ublue-motd.
 - Exercise the `commit` subcommand end-to-end.
 
 ## Original Blocker Doc (kept for reference)
@@ -195,9 +230,10 @@ bootc-migrate-composefs commit   # Make composefs permanent after successful boo
 Bootloader: Will migrate to systemd-boot (ESP ready, NVRAM writable).
 ```
 
-## Next Steps
+## Next Steps (ordered by priority)
 
-1. **Re-run E2E with target-sourced systemd-boot** — Confirm Phase 5 extracts systemd-boot from Dakota, registers NVRAM, and VM boots into composefs on next reboot
-2. **Exercise `commit` subcommand** — After verified composefs boot, run `bootc-migrate-composefs commit` and confirm the OSTree fallback is removed from the ESP cleanly
-3. **Realistic Bluefin user setup in E2E** — Add a primary `bluefin` user via useradd inside the VM pre-migration, drop `gnome-initial-setup-done` markers, populate dconf/.local/share to mirror a real first-boot state
-4. **Post-reboot validation** — Verify /var, /etc, /home persistence after successful composefs boot
+1. **Re-run E2E with dangling-symlink fix** — confirm SSH-after-reboot, `bootc status` reports composefs, and `cat /proc/cmdline` contains `composefs=<hex>`.
+2. **Exercise `commit` subcommand** — After composefs boots stably, run `bootc-migrate-composefs commit` and confirm the OSTree fallback is removed from the ESP cleanly.
+3. **Realistic Bluefin user setup in E2E** — Add a primary `bluefin` user via useradd inside the VM pre-migration, drop `gnome-initial-setup-done` markers, populate dconf/.local/share to mirror a real first-boot state.
+4. **Post-reboot validation** — Verify /var, /etc, /home persistence after successful composefs boot.
+5. **Reconsider prune scope** — current prune only drops symlinks under /usr/* with absent targets. Watch for cases where target is in /opt or /var (rare); broader audit may be needed if other cascades surface.
