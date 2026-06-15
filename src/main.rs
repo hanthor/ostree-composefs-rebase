@@ -122,6 +122,7 @@ fn main() {
                 esp_fs_type: Some("vfat".to_string()),
                 supports_reflink: true,
                 is_btrfs: true,
+                fs_type: Some("btrfs".to_string()),
                 ostree_repo_size_bytes: 0,
                 composefs_free_bytes: 0,
                 esp_ready_for_systemd_boot: true,
@@ -142,6 +143,7 @@ fn main() {
         println!("  - ESP Filesystem:        {}", fs);
     }
     println!("  - ESP Free Space:        {:.2} MB", report.esp_free_space_bytes as f64 / (1024.0 * 1024.0));
+    println!("  - Filesystem:            {}", report.fs_type.as_deref().unwrap_or("unknown"));
     println!("  - Btrfs Filesystem:      {}", if report.is_btrfs { "Yes" } else { "No" });
     if report.sysroot_was_ro {
         println!("  - /sysroot was RO:       Yes (remounted rw for reflink test)");
@@ -539,9 +541,10 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-/// Mount the btrfs device backing /sysroot at `target`, bypassing the
+/// Mount the device backing /sysroot at `target`, bypassing the
 /// composefs EROFS overlay so that paths like /sysroot/ostree can be
-/// mutated directly on the underlying filesystem.
+/// mutated directly on the underlying filesystem. Works on btrfs, xfs,
+/// and any other filesystem that can be mounted twice.
 fn mount_sysroot_btrfs_at(target: &Path) -> Result<()> {
     let mounts = std::fs::read_to_string("/proc/mounts")
         .context("failed to read /proc/mounts")?;
@@ -549,11 +552,11 @@ fn mount_sysroot_btrfs_at(target: &Path) -> Result<()> {
         .lines()
         .find(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            parts.len() >= 3 && parts[1] == "/sysroot" && parts[2] == "btrfs"
+            parts.len() >= 3 && parts[1] == "/sysroot"
         })
         .and_then(|line| line.split_whitespace().next())
         .map(|s| s.to_string())
-        .context("could not find btrfs device for /sysroot in /proc/mounts")?;
+        .context("could not find device for /sysroot in /proc/mounts")?;
 
     let status = std::process::Command::new("mount")
         .arg(&device)
