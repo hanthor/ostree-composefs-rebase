@@ -85,13 +85,17 @@ Candidate next probes:
 
 ## Pending
 
-- **Slice 2**: E2E verify `bootc status` works post-migration (no "No manifest_digest" error). E2E currently running.
+- **Slice 2**: E2E verify `bootc status` works post-migration (no "No manifest_digest" error). E2E currently running (2026-06-15 07:57).
 - **Slice 3**: E2E verify `e2e-sshd.socket` active post-migration.
-- **Slice 4**: Debug sshd.service 255/EXCEPTION on Dakota boot.
+- **Slice 4**: sshd.service 255/EXCEPTION — root cause fixed (`9027a5f`), awaiting E2E verification.
 - **Slice 5**: Full /var, /etc, /home persistence assertions.
 - Realistic user setup in E2E (primary user via useradd, gnome-initial-setup-done, dconf, ~/.config).
 - `--post-hook-dir` flag (default `/etc/bootc-migrate-composefs/post-migrate.d`) for migration-specific cleanup like ublue-motd.
 - Exercise the `commit` subcommand end-to-end.
+
+## Future UX
+
+- **Pre-migration config drift GUI**: Compute diff between OSTree factory /etc and live /etc (like `bootc`'s `get_etc_diff` + `print_diff`), present as an interactive TUI/GUI with per-file checkboxes. User decides what to keep vs revert to target defaults before migration begins. This maps directly to `bootc etc-merge`'s `compute_diff` output — we'd just render it interactively instead of printing to stdout.
 
 ## Original Blocker Doc (kept for reference)
 
