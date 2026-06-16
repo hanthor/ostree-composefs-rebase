@@ -248,6 +248,11 @@ cleanup() {
     if [ -n "${TAIL_PID:-}" ]; then
         kill "$TAIL_PID" 2>/dev/null || true
     fi
+    if [ -n "${HB_PID:-}" ]; then
+        kill "$HB_PID" 2>/dev/null || true
+    fi
+    # Kill any orphaned tail processes to prevent hanging stdout/stderr in CI
+    sudo pkill -f 'tail -F.*qemu.log' 2>/dev/null || true
     if [ -n "${QEMU_PID:-}" ]; then
         step "Terminating QEMU (PID: $QEMU_PID)..."
         sudo kill "$QEMU_PID" 2>/dev/null || true
@@ -631,6 +636,7 @@ heartbeat "$MIGRATE_BG" 20 "migration in progress" &
 HB_PID=$!
 wait "$MIGRATE_BG"
 kill "$HB_PID" 2>/dev/null || true
+HB_PID=""
 MIGRATE_RC=$(cat /tmp/e2e-migrate.rc 2>/dev/null | cut -d= -f2)
 rm -f /tmp/e2e-migrate.rc
 step "Migration completed in $((SECONDS - MIGRATE_START))s (rc=${MIGRATE_RC:-?})"
