@@ -19,4 +19,14 @@
 4. ❌ Direct menuentry in ESP grub.cfg — file write works, but GRUB still shows old blscfg entries
 
 ## Next step
-In `phase5_setup_bootloader`, after systemd-boot install: also write composefs kernel+initrd to `/boot/bootc_composefs-*/`, write composefs BLS entry to `/boot/loader/entries/`, and set GRUB saved_entry. Same as GRUB2 path.
+EROFS composefs image mounts during boot (`erofs: mounted...`) but is not used as root — system boots OSTree fallback. Likely cause: ext4 loopback at /sysroot/composefs isn't mounted early enough in initrd for ostree-prepare-root to find the composefs images. The xfs-mount.cpio mount unit may need `Before=ostree-prepare-root.service` ordering.
+
+**Confirmed**: Direct `-kernel` boot with composefs cmdline → EROFS mounts but OSTree is root. Migration artifacts are correct. Boot ordering is the issue.
+
+**Verified working**:
+- Migration Phases 0-5 ✅
+- Initrd rebuild (xfs.ko + loopback mount unit) ✅ 
+- Host-side .raw scan (all 5 checks) ✅
+- EROFS image at /sysroot/composefs/images/ ✅
+- EROFS mounts during boot ✅
+- Not used as root ❌
