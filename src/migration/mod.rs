@@ -575,10 +575,28 @@ fn verify_migration(verity: &VerityDigest, _report: &PreflightReport) -> Result<
     }
 
     // 4. Verify BLS entry exists and references composefs.
+    // BLS entries may be on the ESP (systemd-boot) or /boot (GRUB2).
+    // Use /proc/mounts to find the ESP mount point instead of guessing.
+    let mut entries_dirs: Vec<PathBuf> = vec!["/boot/loader/entries".into()];
+    if let Some(esp_dev) = find_esp_device() {
+        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+            for line in mounts.lines() {
+                if line.starts_with(&esp_dev) {
+                    if let Some(mp) = line.split_whitespace().nth(1) {
+                        entries_dirs.push(Path::new(mp).join("loader/entries"));
+                    }
+                    break;
+                }
+            }
+        }
+        // Also check common static mount points.
+        for mp in &["/boot/efi", "/efi"] {
+            entries_dirs.push(Path::new(mp).join("loader/entries"));
+        }
+    }
     let mut found_bls = false;
-    for entries_mp in &["/boot/efi/loader/entries", "/efi/loader/entries", "/boot/loader/entries"]
-    {
-        if let Ok(rd) = fs::read_dir(entries_mp) {
+    for entries_dir in &entries_dirs {
+        if let Ok(rd) = fs::read_dir(entries_dir) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with("bootc_") {
