@@ -171,6 +171,23 @@ RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config && \
     echo 'Port 22' >> /etc/ssh/sshd_config
 # Disable firewalld (CentOS Stream 10 blocks SSH by default)
 RUN systemctl disable firewalld 2>/dev/null || true
+# Auto-login on serial console (ttyS0) so we can run commands via
+# expect/screen even if SSH fails.
+RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d && \
+    printf '%s\n' \
+        '[Service]' \
+        'ExecStart=' \
+        'ExecStart=-/sbin/agetty -o "-p -f root" --autologin root --noclear %I 115200 linux' \
+        > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf && \
+    systemctl enable serial-getty@ttyS0.service
+# Ensure SSH host keys are generated early (before e2e-sshd socket tries sshd -i).
+RUN mkdir -p /etc/systemd/system/sshd-keygen.target.wants && \
+    ln -sf /usr/lib/systemd/system/sshd-keygen@.service \
+           /etc/systemd/system/sshd-keygen.target.wants/sshd-keygen@rsa.service && \
+    ln -sf /usr/lib/systemd/system/sshd-keygen@.service \
+           /etc/systemd/system/sshd-keygen.target.wants/sshd-keygen@ecdsa.service && \
+    ln -sf /usr/lib/systemd/system/sshd-keygen@.service \
+           /etc/systemd/system/sshd-keygen.target.wants/sshd-keygen@ed25519.service
 # e2e-sshd.socket for TCP 22 (Bluefin's sshd only binds Unix-local + vsock).
 RUN mkdir -p /etc/systemd/system && \
     printf '%s\n' \
