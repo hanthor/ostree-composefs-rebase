@@ -408,38 +408,60 @@ fn ensure_e2e_ssh_socket(etc_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Supplement identity DBs (passwd/shadow/group) in the merged deploy /etc
-/// with system users from the target image that don't already exist. Uses
-/// registry streaming (reliable) rather than the EROFS mount (zero-fills
-/// content past ~4KB threshold).
+/// Supplement identity DBs and critical config files in the merged deploy
+/// /etc with target-image versions. Uses registry streaming (reliable) rather
+/// than the EROFS mount, which zero-fills content past ~4KB threshold
+/// (corrupting e.g. /etc/dbus-1/system.conf -> dbus fails to start, cascading
+/// to polkit/logind/sshd).
+///
+/// Batch-extracts all needed files in a single pass through layers (fast:
+/// ~8 min vs ~45 min for individual calls).
 fn supplement_identity_dbs_from_registry(target_image: &str, etc_dir: &Path) -> Result<()> {
     let scratch =
         TempDir::new_in("/var/tmp").context("failed to create temp dir for identity-DB extract")?;
-    let scratch_etc = scratch.path().join("etc");
-    fs::create_dir_all(&scratch_etc).context("failed to create scratch etc dir")?;
+    // Batch all files into one single-pass extraction to avoid re-scanning
+    // all 120 layers for each file.
+    let mut id_bufs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut cfg_bufs: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-    // Try each file individually; tolerate "missing in image" because not
-    // every bootc target ships every identity DB (Dakota has no /etc/subuid
-    // or /etc/subgid). Any other error from a given file is logged and the
-    // others continue.
-    let names = ["passwd", "shadow", "group", "gshadow", "subuid", "subgid"];
-    for name in &names {
+    // Identity DBs
+    let id_names = ["passwd", "shadow", "group", "gshadow", "subuid", "subgid"];
+    for name in &id_names {
         let src = PathBuf::from("/etc").join(name);
-        let dst = scratch_etc.join(name);
-        let pair = [(src.as_path(), dst.as_path())];
-        if let Err(e) = extract_files_via_registry(target_image, &pair) {
-            let es = format!("{e:#}");
-            if es.contains("missing files") || es.contains("No such file") {
-                // Image doesn't ship this file; that's fine.
-                continue;
-            }
-            eprintln!("[phase4] warning: skopeo extract of /etc/{name} failed: {es}");
-        }
+        let dst = scratch.path().join(name);
+        id_bufs.push((src, dst));
     }
 
+    // Critical EROFS-threshold config files (>~4KB, zero-filled by bare mount)
+    let cfg_files = [
+        ("/etc/dbus-1/system.conf", "dbus-1/system.conf"),
+        ("/etc/dbus-1/session.conf", "dbus-1/session.conf"),
+    ];
+    for (src_path, rel_dst) in &cfg_files {
+        let src = PathBuf::from(src_path);
+        let dst = scratch.path().join(rel_dst);
+        cfg_bufs.push((src, dst));
+    }
+
+    // Build the pairs slice from references to the owned PathBufs
+    let mut pairs: Vec<(&Path, &Path)> = Vec::with_capacity(id_bufs.len() + cfg_bufs.len());
+    for (src, dst) in &id_bufs {
+        pairs.push((src.as_path(), dst.as_path()));
+    }
+    for (src, dst) in &cfg_bufs {
+        pairs.push((src.as_path(), dst.as_path()));
+    }
+
+    // Single batch extract — one pass through all layers
+    if let Err(e) = extract_files_via_registry(target_image, &pairs) {
+        // Log but don't fail — the merge may have produced valid content for some files.
+        eprintln!("[phase4] warning: batch registry extract failed: {e:#}");
+    }
+
+    // --- Supplement identity DBs (union-merge by first colon field) ---
     let mut supplemented = 0usize;
-    for name in &names {
-        let dakota_path = scratch_etc.join(name);
+    for name in &id_names {
+        let dakota_path = scratch.path().join(name);
         let merged_path = etc_dir.join(name);
         if !dakota_path.exists() {
             continue;
@@ -451,8 +473,6 @@ fn supplement_identity_dbs_from_registry(target_image: &str, etc_dir: &Path) -> 
         let current = fs::read_to_string(&merged_path).unwrap_or_default();
         let merged = line_union_by_first_colon(&current, &dakota);
         if merged != current {
-            // Permissions on shadow/gshadow must stay 000; the existing file
-            // already has them, so write in place and preserve mode/xattrs.
             let perms = fs::metadata(&merged_path).ok().map(|m| m.permissions());
             fs::write(&merged_path, merged.as_bytes())
                 .with_context(|| format!("failed to rewrite {}", merged_path.display()))?;
@@ -468,10 +488,36 @@ fn supplement_identity_dbs_from_registry(target_image: &str, etc_dir: &Path) -> 
             supplemented
         );
     }
+
+    // --- Overwrite critical config files that EROFS zero-filled ---
+    let cfg_names = [
+        "/etc/dbus-1/system.conf",
+        "/etc/dbus-1/session.conf",
+    ];
+    for src_path in &cfg_names {
+        let rel_dst = src_path.strip_prefix("/etc/").unwrap_or(src_path);
+        let scratch_path = scratch.path().join(rel_dst);
+        let merged_path = etc_dir.join(rel_dst);
+        if !scratch_path.exists() {
+            continue;
+        }
+        let content = fs::read(&scratch_path).unwrap_or_default();
+        if content.is_empty() || content.iter().all(|&b| b == 0) {
+            continue;  // Registry also returned zeros — file truly absent
+        }
+        if let Some(parent) = merged_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&merged_path, &content)
+            .with_context(|| format!("failed to write {}", merged_path.display()))?;
+        println!("[phase4] overwrote {} with registry-extracted target version", rel_dst);
+    }
+
     Ok(())
 }
 
-#[allow(dead_code)]
+
+
 fn line_union_by_first_colon(current: &str, new: &str) -> String {
     use std::collections::HashSet;
     let key_of = |line: &str| line.split(':').next().unwrap_or("").to_string();
