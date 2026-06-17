@@ -295,7 +295,14 @@ fn rebuild_initrd_with_lvm_if_needed(
     }
 
     // Rebuild with dracut.
+    // Always include the bootc module so bootc-root-setup.service is in
+    // the initrd — this is what mounts the composefs EROFS as root.
     let mods_str = mods.join(" ");
+    let dracut_add = if mods.is_empty() {
+        "bootc".to_string()
+    } else {
+        format!("{} bootc", mods_str)
+    };
     let mut cmd = Command::new(dracut_path);
     cmd.arg("--kver")
         .arg(kver)
@@ -303,9 +310,7 @@ fn rebuild_initrd_with_lvm_if_needed(
         .arg("--kmoddir")
         .arg(kmoddir_arg.to_str().unwrap_or(""));
     cmd.env("DRACUT_KMODDIR_OVERRIDE", "1");
-    if !mods.is_empty() {
-        cmd.arg("--add").arg(&mods_str);
-    }
+    cmd.arg("--add").arg(&dracut_add);
     cmd.arg(initrd_dst.to_str().unwrap_or("/dev/null"));
     let dracut_status = cmd.status();
 
