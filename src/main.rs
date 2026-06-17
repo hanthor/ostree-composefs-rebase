@@ -109,18 +109,40 @@ fn main() {
         }
     };
 
-    // Redirect stdout+stderr to log file so no output is lost even if the
-    // terminal session drops. The log can be tailed with `tail -f`.
-    if let Some(f) = log_file {
-        use std::os::unix::io::AsRawFd;
-        let fd = f.as_raw_fd();
-        unsafe {
-            libc::dup2(fd, libc::STDOUT_FILENO);
-            libc::dup2(fd, libc::STDERR_FILENO);
+    // Tee stdout+stderr to log file via a pipe so output is visible both
+    // on the terminal (over SSH for E2E) and in the persistent log.
+    if let Some(log_file) = log_file {
+        use std::os::unix::io::FromRawFd;
+        let mut pipe_fds = [-1i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0 {
+            let pipe_read = pipe_fds[0];
+            let pipe_write = pipe_fds[1];
+            // Save original stdout fd so the tee thread can write to the
+            // real terminal even after we dup2 the pipe over stdout/stderr.
+            let orig_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_read) };
+                let mut stdout = unsafe { std::fs::File::from_raw_fd(orig_stdout) };
+                let mut log = log_file;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let _ = log.write_all(&buf[..n]);
+                            let _ = stdout.write_all(&buf[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            unsafe {
+                libc::dup2(pipe_write, libc::STDOUT_FILENO);
+                libc::dup2(pipe_write, libc::STDERR_FILENO);
+                libc::close(pipe_write);
+            }
         }
-        // The File handle is leaked intentionally — its fd was duplicated
-        // into stdout/stderr and must survive for the process lifetime.
-        std::mem::forget(f);
     }
 
     // Handle --commit subcommand (#8)
