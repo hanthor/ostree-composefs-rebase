@@ -21,12 +21,30 @@
 ## Next step
 EROFS composefs image mounts during boot (`erofs: mounted...`) but is not used as root — system boots OSTree fallback. Likely cause: ext4 loopback at /sysroot/composefs isn't mounted early enough in initrd for ostree-prepare-root to find the composefs images. The xfs-mount.cpio mount unit may need `Before=ostree-prepare-root.service` ordering.
 
-**Confirmed**: Direct `-kernel` boot with composefs cmdline → EROFS mounts but OSTree is root. Migration artifacts are correct. Boot ordering is the issue.
+## RESOLVED: Composefs boots on XFS!
+
+**Status**: SUCCESSFUL after hotfixes:
+- `bootc-root-setup.service` (from bootc dracut module) mounts composefs as root
+- Requires: meta.json in loopback repo, .wants symlink for mount unit, Requires= dependency
+- Hostname preserved as "bluefin" from /etc merge (expected)
 
 **Verified working**:
 - Migration Phases 0-5 ✅
-- Initrd rebuild (xfs.ko + loopback mount unit) ✅ 
-- Host-side .raw scan (all 5 checks) ✅
-- EROFS image at /sysroot/composefs/images/ ✅
-- EROFS mounts during boot ✅
-- Not used as root ❌
+- Initrd rebuild (xfs.ko + loopback mount unit) ✅
+- Registry streaming for kernel modules ✅
+- bootc-root-setup.service in initrd ✅
+- Composefs EROFS mounts as root ✅
+- Dakota userspace (wallpaper, firstboot services) ✅
+
+**Remaining (minor)** :
+- SSH not available (e2e-sshd.socket not in composefs /etc)
+- dbus failures on first boot
+- Need to incorporate all hotfixes into migration code
+
+**Hotfixes applied to checkpoint** :
+1. bootc-modules.cpio with bootc-root-setup.service + initramfs-setup
+2. xfs-mount.cpio with .wants symlink for auto-mount
+3. Drop-in Requires=sysroot-composefs.mount on bootc-root-setup.service
+4. meta.json in loopback repo (fsverity-sha512-12, verity:false)
+5. BLS entry with /boot/ paths for GRUB
+6. grub.cfg with set default=1 for composefs entry
