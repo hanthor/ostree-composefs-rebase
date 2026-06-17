@@ -10,6 +10,7 @@ use kernel_options::get_kernel_options;
 use os_release::{bls_entry_filename, bls_entry_title, read_os_release};
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -375,7 +376,12 @@ fn rebuild_initrd_with_lvm_if_needed(
         fs::create_dir_all(setup_dst.parent().unwrap_or(Path::new("/"))).ok();
         let extract_files = vec![(Path::new("/usr/lib/bootc/initramfs-setup"), setup_dst.as_path())];
         let setup_ok = match extract_files_via_registry(target_image, &extract_files) {
-            Ok(()) => true,
+            Ok(()) => {
+                // Make the binary executable — it must be run as /usr/lib/bootc/initramfs-setup
+                // in the initramfs, and the kernel's execve requires +x.
+                let _ = fs::set_permissions(&setup_dst, std::fs::Permissions::from_mode(0o755));
+                true
+            }
             Err(e) => {
                 eprintln!("[phase5] Warning: could not extract initramfs-setup: {e}");
                 false
