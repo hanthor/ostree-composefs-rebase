@@ -19,6 +19,58 @@ use tempfile::TempDir;
 
 const LOCK_PATH: &str = "/var/run/bootc-migrate-composefs.lock";
 
+/// Embedded bootc dracut module script (51bootc). Provides bootc-root-setup.service
+/// which mounts the composefs EROFS as root in the initramfs.
+const BOOTC_DRACUT_MODULE: &str = r##"#!/bin/bash
+installkernel() {
+    instmods erofs overlay
+}
+check() {
+    return 255
+}
+depends() {
+    return 0
+}
+install() {
+    local service=bootc-root-setup.service
+    dracut_install /usr/lib/bootc/initramfs-setup
+    inst_simple "${systemdsystemunitdir}/${service}"
+    mkdir -p "${initdir}${systemdsystemunitdir}/initrd-root-fs.target.wants"
+    ln_r "${systemdsystemunitdir}/${service}" \
+        "${systemdsystemunitdir}/initrd-root-fs.target.wants/${service}"
+    [[ -e /usr/lib/composefs/setup-root-conf.toml ]] && \
+        inst_simple /usr/lib/composefs/setup-root-conf.toml
+}
+"##;
+
+/// Systemd unit that mounts the composefs EROFS as root in the initramfs.
+const BOOTC_ROOT_SETUP_SERVICE: &str = r##"[Unit]
+Description=bootc setup root
+Documentation=man:bootc(1)
+DefaultDependencies=no
+ConditionKernelCommandLine=composefs
+ConditionPathExists=/etc/initrd-release
+After=sysroot.mount
+After=ostree-prepare-root.service
+Requires=sysroot.mount
+Before=initrd-root-fs.target
+OnFailure=emergency.target
+OnFailureJobMode=isolate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/bootc/initramfs-setup setup-root
+StandardInput=null
+StandardOutput=journal
+StandardError=journal+console
+RemainAfterExit=yes
+"##;
+
+/// Minimum composefs repository metadata (meta.json). Written to the repo
+/// during Phase 3 so bootc-root-setup.service can open it in the initrd.
+const COMPOSEFS_META_JSON: &str =
+    r##"{"version":1,"algorithm":"fsverity-sha512-12","verity":false}"##;
+
 fn acquire_lock() -> Result<File> {
     let lock = File::create(LOCK_PATH).context("failed to create lock file")?;
     let fd = lock.as_raw_fd();
@@ -294,9 +346,47 @@ fn rebuild_initrd_with_lvm_if_needed(
         eprintln!("[phase5] Warning: depmod failed — dracut may not find all modules");
     }
 
+    // Prepare bootc dracut module files. Bluefin LTS doesn't have the
+    // bootc package, so /usr/lib/dracut/modules.d/51bootc/ doesn't exist.
+    // We need to inject the files ourselves.
+    let bootc_dir = TempDir::new_in("/var/tmp").ok();
+    if let Some(ref bd) = bootc_dir {
+        // Write the dracut module script (embedded in binary)
+        let mod_dir = bd.path().join("usr/lib/dracut/modules.d/51bootc");
+        fs::create_dir_all(&mod_dir).ok();
+        fs::write(mod_dir.join("module-setup.sh"), BOOTC_DRACUT_MODULE).ok();
+
+        // Write bootc-root-setup.service
+        let svc_dir = bd.path().join("usr/lib/systemd/system");
+        fs::create_dir_all(&svc_dir).ok();
+        fs::write(svc_dir.join("bootc-root-setup.service"), BOOTC_ROOT_SETUP_SERVICE).ok();
+
+        // Enable it in initrd-root-fs.target.wants
+        let wants_dir = bd.path().join("usr/lib/systemd/system/initrd-root-fs.target.wants");
+        fs::create_dir_all(&wants_dir).ok();
+        let _ = std::os::unix::fs::symlink(
+            "../bootc-root-setup.service",
+            wants_dir.join("bootc-root-setup.service"),
+        );
+
+        // Extract initramfs-setup binary from target image via registry
+        println!("[phase5] extracting initramfs-setup from target image...");
+        let setup_dst = bd.path().join("usr/lib/bootc/initramfs-setup");
+        fs::create_dir_all(setup_dst.parent().unwrap_or(Path::new("/"))).ok();
+        let extract_files = vec![(Path::new("/usr/lib/bootc/initramfs-setup"), setup_dst.as_path())];
+        let setup_ok = match extract_files_via_registry(target_image, &extract_files) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[phase5] Warning: could not extract initramfs-setup: {e}");
+                false
+            }
+        };
+        if setup_ok {
+            println!("[phase5] bootc dracut module files prepared");
+        }
+    }
+
     // Rebuild with dracut.
-    // Always include the bootc module so bootc-root-setup.service is in
-    // the initrd — this is what mounts the composefs EROFS as root.
     let mods_str = mods.join(" ");
     let dracut_add = if mods.is_empty() {
         "bootc".to_string()
@@ -311,6 +401,11 @@ fn rebuild_initrd_with_lvm_if_needed(
         .arg(kmoddir_arg.to_str().unwrap_or(""));
     cmd.env("DRACUT_KMODDIR_OVERRIDE", "1");
     cmd.arg("--add").arg(&dracut_add);
+    if let Some(ref bd) = bootc_dir {
+        cmd.arg("--include")
+            .arg(bd.path().join("usr").to_str().unwrap_or(""))
+            .arg("/usr");
+    }
     cmd.arg(initrd_dst.to_str().unwrap_or("/dev/null"));
     let dracut_status = cmd.status();
 
@@ -335,6 +430,18 @@ fn rebuild_initrd_with_lvm_if_needed(
             fs::write(
                 unit_dir.join("sysroot-composefs.mount"),
                 "[Unit]\nDescription=ComposeFS Loopback Mount\nAfter=sysroot.mount\nBefore=initrd-root-fs.target bootc-root-setup.service\nDefaultDependencies=no\n\n[Mount]\nWhat=/sysroot/composefs-loopback.ext4\nWhere=/sysroot/composefs\nType=ext4\nOptions=loop,ro\n\n[Install]\nWantedBy=initrd-root-fs.target\n",
+            )?;
+            // Enable the mount unit in initrd-root-fs.target.wants and add
+            // Requires dependency from bootc-root-setup.service so the
+            // loopback is mounted BEFORE composefs is mounted as root.
+            let wants_dir = unit_dir.join("initrd-root-fs.target.wants");
+            fs::create_dir_all(&wants_dir)?;
+            let _ = std::os::unix::fs::symlink("../sysroot-composefs.mount", wants_dir.join("sysroot-composefs.mount"));
+            let dropin_dir = unit_dir.join("bootc-root-setup.service.d");
+            fs::create_dir_all(&dropin_dir)?;
+            fs::write(
+                dropin_dir.join("RequiresLoopback.conf"),
+                "[Unit]\nRequires=sysroot-composefs.mount\nAfter=sysroot-composefs.mount\n",
             )?;
             if !Command::new("sh")
                 .arg("-c")
@@ -940,6 +1047,15 @@ fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDiges
     println!("Sealing composefs image...");
     crate::composefs::seal_image(config_digest).context("failed to seal composefs image")?;
     println!("Image sealed successfully.");
+
+    // Write meta.json to the composefs repository so that
+    // bootc-root-setup.service can open it in the initramfs.
+    let meta_path = Path::new("/sysroot/composefs/meta.json");
+    if let Err(e) = fs::write(meta_path, COMPOSEFS_META_JSON) {
+        eprintln!("Warning: could not write meta.json: {e:#}");
+    } else {
+        println!("  Wrote composefs meta.json");
+    }
 
     Ok(verity)
 }
@@ -1755,6 +1871,46 @@ fn phase5_setup_bootloader(
                         .unwrap_or(false)
                     {
                         println!("  Set GRUB default to {} (fallback path).", entry_id);
+                    }
+                }
+
+                // Also write a GRUB-compatible composefs BLS entry to /boot/
+                // so GRUB can boot composefs (even when systemd-boot is used).
+                let boot_composefs_dir = Path::new("/boot").join(&boot_dir_name);
+                if !boot_composefs_dir.join("vmlinuz").exists() {
+                    fs::create_dir_all(&boot_composefs_dir).ok();
+                    // Copy files from ESP to /boot/ for GRUB access.
+                    let esp_src = esp_path.join("EFI/Linux").join(&boot_dir_name);
+                    for f in &["vmlinuz", "initrd", "xfs-mount.cpio"] {
+                        let src = esp_src.join(f);
+                        if src.exists() {
+                            let _ = fs::copy(&src, boot_composefs_dir.join(f));
+                        }
+                    }
+                    // Write a BLS entry with /boot-relative paths (GRUB needs these).
+                    let grub_bls = format!(
+                        "title Linux (composefs)\nversion 7.0.7\nlinux /{}/vmlinuz\ninitrd /{}/initrd\ninitrd /{}/xfs-mount.cpio\noptions {}\nsort-key bootc-linux-0\n",
+                        boot_dir_name,
+                        boot_dir_name,
+                        boot_dir_name,
+                        options_str
+                    );
+                    let grub_entries = Path::new("/boot/loader/entries");
+                    fs::create_dir_all(grub_entries).ok();
+                    let _ = fs::write(grub_entries.join(&composefs_entry.filename), &grub_bls);
+                    println!("  Wrote GRUB-compatible composefs BLS entry to /boot/loader/entries/");
+
+                    // Inject set default="${saved_entry}" into grub.cfg so GRUB
+                    // boots composefs as the default.
+                    let grub_cfg = "/boot/grub2/grub.cfg";
+                    if let Ok(cfg) = fs::read_to_string(grub_cfg) {
+                        let default_kwd = "set default=\"${saved_entry}\"";
+                        if !cfg.contains(default_kwd) {
+                            let patched = cfg.replace("\nblscfg\n", &format!("\n{}\nblscfg\n", default_kwd));
+                            if patched != cfg {
+                                let _ = fs::write(grub_cfg, &patched);
+                            }
+                        }
                     }
                 }
             }
