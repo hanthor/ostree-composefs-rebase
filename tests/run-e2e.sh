@@ -612,12 +612,12 @@ step "=== Running migration inside VM ==="
 # Clean composefs state from previous runs so free-space check passes.
 ssh $SSH_OPTS root@localhost "rm -rf /sysroot/composefs /sysroot/state && mkdir -p /sysroot/composefs" 2>/dev/null || true
 
-# Run the migration inside the VM in the background, tail the log file for
-# streaming, and wait for the migration PID to complete. This avoids the
-# brittle SSH-pipe+awk pattern that breaks when stdout is redirected.
+# Run the migration inside the VM, tailing the log file for real-time output.
+# The remote script starts migration in background, streams the log back via
+# ssh stdout, and waits for completion so ssh itself reports the exit code.
 MIGRATE_START=$SECONDS
-ssh $SSH_OPTS root@localhost bash -s <<'MIGSCRIPT' &
-  /var/tmp/bootc-migrate-composefs --target-image "$1" --force --skip-import \
+ssh $SSH_OPTS root@localhost "MIG_TARGET='$VM_TARGET_IMAGE' bash -s" <<'MIGSCRIPT'
+  /var/tmp/bootc-migrate-composefs --target-image "$MIG_TARGET" --force --skip-import \
     > /var/log/bootc-migrate-composefs.log 2>&1 &
   MIG_PID=$!
   trap 'kill $MIG_PID 2>/dev/null; exit 1' EXIT
@@ -628,18 +628,13 @@ ssh $SSH_OPTS root@localhost bash -s <<'MIGSCRIPT' &
   wait "$MIG_PID"
   MIG_RC=$?
   kill "$TAIL_PID" 2>/dev/null || true
-  # Signal the host: write rc to a marker file so the host can read it.
-  echo "$MIG_RC" > /tmp/e2e-migrate.rc
   exit "$MIG_RC"
-MIGSCRIPT "$VM_TARGET_IMAGE"
-MIGRATE_RC=${PIPESTATUS[0]}
-# Fetch the rc file from the VM in case PIPESTATUS was unreliable.
-VM_RC=$(ssh $SSH_OPTS root@localhost "cat /tmp/e2e-migrate.rc 2>/dev/null || echo 1" 2>/dev/null || echo 1)
-MIGRATE_RC="${MIGRATE_RC:-${VM_RC}}"
-step "Migration completed in $((SECONDS - MIGRATE_START))s (rc=${MIGRATE_RC:-?})"
-if [ "${MIGRATE_RC:-1}" != "0" ]; then
-    echo "ERROR: migration binary exited with rc=${MIGRATE_RC:-?}" >&2
-    exit "${MIGRATE_RC:-1}"
+MIGSCRIPT
+MIGRATE_RC=$?
+step "Migration completed in $((SECONDS - MIGRATE_START))s (rc=$MIGRATE_RC)"
+if [ "$MIGRATE_RC" != "0" ]; then
+    echo "ERROR: migration binary exited with rc=$MIGRATE_RC" >&2
+    exit "$MIGRATE_RC"
 fi
 
 step "=== Verifying migration artifacts before reboot ==="

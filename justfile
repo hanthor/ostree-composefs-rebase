@@ -66,6 +66,23 @@ e2e-debug: build
       grep -E 'FAILED|DEPEND' e2e-run.log | tail -30; \
       exit $$rc
 
+# === Linting ===
+
+# Run all linters (shellcheck, rustfmt, clippy)
+lint: lint-shell lint-rust
+
+# Lint shell scripts with shellcheck
+lint-shell:
+    @echo "=== shellcheck ==="
+    shellcheck tests/run-e2e.sh
+
+# Lint Rust code (format + clippy)
+lint-rust:
+    @echo "=== cargo fmt --check ==="
+    cargo fmt --check
+    @echo "=== cargo clippy ==="
+    cargo clippy -- -D warnings
+
 # === Diagnostics ===
 
 # View the last E2E log
