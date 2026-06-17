@@ -9,26 +9,26 @@ on:
 
 # Cancel superseded runs on the same ref so PR pushes don't queue up redundant jobs.
 concurrency:
-  group: e2e-${{ github.ref }}
+  group: e2e-${{ github.ref }}-${{ matrix.scenario.filesystem }}
   cancel-in-progress: true
 
 jobs:
   e2e:
     name: ${{ matrix.scenario.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         scenario:
-          - name: bluefin -> dakota (systemd-boot + composefs)
+          - name: bluefin -> dakota (btrfs + composefs)
             base: ghcr.io/projectbluefin/bluefin:stable
             target: ghcr.io/projectbluefin/dakota:stable
-          # fedora-bootc self-migration is the simpler sanity case; revisit once
-          # the bluefin scenario is green end-to-end.
-          # - name: fedora-bootc self-migration
-          #   base: quay.io/fedora/fedora-bootc:44
-          #   target: quay.io/fedora/fedora-bootc:44
+            filesystem: btrfs
+          - name: bluefin:lts -> dakota (xfs + loopback)
+            base: ghcr.io/projectbluefin/bluefin:lts
+            target: ghcr.io/projectbluefin/dakota:stable
+            filesystem: xfs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -75,11 +75,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install just
+        uses: extractions/setup-just@v2
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
-
-      - name: Build migration binary
-        run: cargo build --release && cargo test --release
 
       # Bring up a local podman registry so the VM can fetch the target image
       # via the 10.0.2.2:5000 host-loopback alias (hard-coded in the e2e script).
@@ -104,6 +104,7 @@ jobs:
           sudo podman push --tls-verify=false "$target_local"
           echo "BASE_IMAGE=${{ matrix.scenario.base }}" >> "$GITHUB_ENV"
           echo "TARGET_IMAGE=${{ matrix.scenario.target }}" >> "$GITHUB_ENV"
+          echo "FILESYSTEM=${{ matrix.scenario.filesystem }}" >> "$GITHUB_ENV"
 
       - name: Disk space before E2E
         run: df -h /
@@ -112,9 +113,10 @@ jobs:
         id: e2e
         run: |
           # Run as root: loop mounts, podman --privileged, and OVMF VARS pflash
-          # all need it. -E so BASE_IMAGE/TARGET_IMAGE flow through.
+          # all need it. The matrix sets BASE_IMAGE / TARGET_IMAGE / FILESYSTEM
+          # via GITHUB_ENV; just picks them up via env_var_or_default.
           set -o pipefail
-          sudo -E PATH="$PATH" ./tests/run-e2e.sh 2>&1 | tee e2e-run.log
+          PROFILE_FLAG=--release just e2e 2>&1 | tee e2e-run.log
 
       - name: Disk space after E2E
         if: always()
