@@ -227,8 +227,11 @@ INSTALL_IMAGE="$MODIFIED_IMAGE"
 echo "Using install image: $INSTALL_IMAGE"
 
 # 5. Create and initialize disk image (or restore checkpoint)
-POST_CKPT="$WORKSPACE_DIR/disk.raw.post-migration"
-if [ -f "$POST_CKPT" ]; then
+if [ "${E2E_FORCE_MIGRATION:-false}" = "true" ]; then
+    SKIP_SETUP=false
+    CHECKPOINT="$WORKSPACE_DIR/disk.raw.pre-migration"
+elif [ -f "$WORKSPACE_DIR/disk.raw.post-migration" ]; then
+    POST_CKPT="$WORKSPACE_DIR/disk.raw.post-migration"
     step "=== Restoring post-migration checkpoint (skip to host-side scan) ==="
     cp "$POST_CKPT" disk.raw
     SKIP_SETUP=post-migration
@@ -412,6 +415,12 @@ sudo ln -sf current "$VAR_DIR/lib/alternatives/default" 2>/dev/null || true
 # Hidden directory
 sudo mkdir -p "$VAR_DIR/cache/.hidden-dir"
 echo "hidden-file-content" | sudo tee "$VAR_DIR/cache/.hidden-dir/secret" >/dev/null
+
+# Stamp the disk with the git commit SHA so we can identify which
+# binary version created this checkpoint (critical for post-mortem).
+E2E_COMMIT=$(git -C "$WORKSPACE_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+echo "Writing E2E commit label: $E2E_COMMIT"
+echo "$E2E_COMMIT $(date -Iseconds)" | sudo tee "$MNT_DIR/e2e-disk-label.txt" >/dev/null
 
 echo "Test fixtures written."
 
