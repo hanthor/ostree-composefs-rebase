@@ -7,16 +7,15 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-# Cancel superseded runs on the same ref so PR pushes don't queue up redundant jobs.
-concurrency:
-  group: e2e-${{ github.ref }}-${{ matrix.scenario.filesystem }}
-  cancel-in-progress: true
-
 jobs:
   e2e:
     name: ${{ matrix.scenario.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Cancel superseded runs on the same ref so PR pushes don't queue up.
+    concurrency:
+      group: e2e-${{ github.ref }}-${{ matrix.scenario.filesystem }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
