@@ -459,29 +459,53 @@ fn verify_migration(verity: &VerityDigest, _report: &PreflightReport) -> Result<
             vmlinuz_candidate = Some(p);
         }
     }
-    // If still not found, try to locate the ESP device and mount it
-    // temporarily for inspection.
+    // If still not found, look up the ESP device and find where it's
+    // already mounted (Phase 5 mounts it at a temp path). Prefer the
+    // existing mount over creating a new one to avoid "already mounted"
+    // errors.
     let _esp_temp_mount: Option<TempDir> = if vmlinuz_candidate.is_none() {
         if let Some(esp_dev) = find_esp_device() {
-            let tmp = TempDir::new_in("/tmp").ok();
-            if let Some(ref t) = tmp {
-                if Command::new("mount")
-                    .args(["-o", "ro", &esp_dev, t.path().to_str().unwrap_or("")])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-                {
-                    let p = t
-                        .path()
-                        .join("EFI/Linux")
-                        .join(&boot_name)
-                        .join("vmlinuz");
-                    if p.exists() {
-                        vmlinuz_candidate = Some(p);
+            // Check if the ESP is already mounted somewhere.
+            let existing_mp = if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+                mounts
+                    .lines()
+                    .find(|l| l.starts_with(&esp_dev))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+            if let Some(ref mp) = existing_mp {
+                let p = Path::new(mp)
+                    .join("EFI/Linux")
+                    .join(&boot_name)
+                    .join("vmlinuz");
+                if p.exists() {
+                    vmlinuz_candidate = Some(p);
+                }
+                None // don't create a temp mount, use existing
+            } else {
+                // Not mounted — mount it temporarily.
+                let tmp = TempDir::new_in("/tmp").ok();
+                if let Some(ref t) = tmp {
+                    if Command::new("mount")
+                        .args(["-o", "ro", &esp_dev, t.path().to_str().unwrap_or("")])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                    {
+                        let p = t
+                            .path()
+                            .join("EFI/Linux")
+                            .join(&boot_name)
+                            .join("vmlinuz");
+                        if p.exists() {
+                            vmlinuz_candidate = Some(p);
+                        }
                     }
                 }
+                tmp
             }
-            tmp
         } else {
             None
         }
