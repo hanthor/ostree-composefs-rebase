@@ -1726,6 +1726,32 @@ fn phase5_setup_bootloader(
                     "systemd-boot installed from target image. Composefs is the default; \
                      OSTree fallback available in the loader menu (3s timeout)."
                 );
+
+                // Also set GRUB's saved_entry so that if OVMF falls back
+                // to shim → GRUB (e.g. after NVRAM reset), it still boots
+                // composefs rather than Bluefin.
+                let entry_id = composefs_entry
+                    .filename
+                    .trim_end_matches(".conf");
+                let grubenv = "/boot/grub2/grubenv";
+                if Path::new(grubenv).exists() || Path::new("/boot/grub2/grub.cfg").exists()
+                {
+                    if Command::new("grub2-editenv")
+                        .args([grubenv, "set", &format!("saved_entry={}", entry_id)])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                    {
+                        println!("  Set GRUB saved_entry={} (fallback boot path).", entry_id);
+                    } else if Command::new("grub2-set-default")
+                        .args([&entry_id])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                    {
+                        println!("  Set GRUB default to {} (fallback path).", entry_id);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!(
