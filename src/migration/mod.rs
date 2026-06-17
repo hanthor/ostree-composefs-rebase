@@ -421,7 +421,7 @@ fn rebuild_initrd_with_lvm_if_needed(
 
 /// Verify that migration artifacts are valid before claiming success.
 /// Returns Err if any critical check fails — the migration is incomplete.
-fn verify_migration(verity: &VerityDigest, report: &PreflightReport) -> Result<()> {
+fn verify_migration(verity: &VerityDigest, _report: &PreflightReport) -> Result<()> {
     println!("=== Verifying migration artifacts ===");
 
     let deploy_dir = Path::new("/sysroot/state/deploy").join(verity.as_hex());
@@ -437,16 +437,59 @@ fn verify_migration(verity: &VerityDigest, report: &PreflightReport) -> Result<(
     println!("  ✓ .origin file is valid INI");
 
     // 2. Verify kernel (vmlinuz) is a valid bzImage, not zeros.
-    let esp_linux =
-        Path::new("/boot/efi/EFI/Linux").join(format!("bootc_composefs-{}", verity.as_hex()));
-    let grub_boot = Path::new("/boot").join(format!("bootc_composefs-{}", verity.as_hex()));
-    let vmlinuz = if esp_linux.join("vmlinuz").exists() {
-        esp_linux.join("vmlinuz")
-    } else if grub_boot.join("vmlinuz").exists() {
-        grub_boot.join("vmlinuz")
+    // The ESP may not be mounted at /boot/efi after Phase 5 — search
+    // common mount points and try to locate + mount the ESP partition.
+    let boot_name = format!("bootc_composefs-{}", verity.as_hex());
+    let grub_vmlinuz = Path::new("/boot").join(&boot_name).join("vmlinuz");
+    let mut vmlinuz_candidate = if grub_vmlinuz.exists() {
+        Some(grub_vmlinuz)
     } else {
-        anyhow::bail!("vmlinuz not found in ESP or /boot");
+        None
     };
+    // Check known ESP mount points.
+    for esp_mp in &["/boot/efi", "/efi"] {
+        if vmlinuz_candidate.is_some() {
+            break;
+        }
+        let p = Path::new(esp_mp)
+            .join("EFI/Linux")
+            .join(&boot_name)
+            .join("vmlinuz");
+        if p.exists() {
+            vmlinuz_candidate = Some(p);
+        }
+    }
+    // If still not found, try to locate the ESP device and mount it
+    // temporarily for inspection.
+    let _esp_temp_mount: Option<TempDir> = if vmlinuz_candidate.is_none() {
+        if let Some(esp_dev) = find_esp_device() {
+            let tmp = TempDir::new_in("/tmp").ok();
+            if let Some(ref t) = tmp {
+                if Command::new("mount")
+                    .args(["-o", "ro", &esp_dev, t.path().to_str().unwrap_or("")])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    let p = t
+                        .path()
+                        .join("EFI/Linux")
+                        .join(&boot_name)
+                        .join("vmlinuz");
+                    if p.exists() {
+                        vmlinuz_candidate = Some(p);
+                    }
+                }
+            }
+            tmp
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let vmlinuz =
+        vmlinuz_candidate.ok_or_else(|| anyhow!("vmlinuz not found in ESP or /boot"))?;
     let magic =
         fs::read(&vmlinuz).with_context(|| format!("failed to read {}", vmlinuz.display()))?;
     if magic.len() < 4 || &magic[..2] != b"MZ" {
@@ -462,17 +505,35 @@ fn verify_migration(verity: &VerityDigest, report: &PreflightReport) -> Result<(
     }
     println!("  ✓ vmlinuz is valid kernel ({} bytes)", magic.len());
 
-    // 3. Verify initrd contains LVM modules if needed.
-    let initrd = if esp_linux.join("initrd").exists() {
-        esp_linux.join("initrd")
-    } else if grub_boot.join("initrd").exists() {
-        grub_boot.join("initrd")
+    // 3. Verify initrd exists and is non-zero (same boot dir as vmlinuz).
+    let initrd = vmlinuz.parent().unwrap_or(Path::new("/")).join("initrd");
+    if !initrd.exists() {
+        // Try the GRUB2 fallback path in /boot.
+        let fallback = Path::new("/boot").join(&boot_name).join("initrd");
+        if fallback.exists() {
+            // initrd is at the GRUB2 path.
+            drop(fallback);
+        } else {
+            anyhow::bail!("initrd not found (checked ESP and /boot)");
+        }
+    }
+    let initrd = if vmlinuz.parent().unwrap_or(Path::new("/")).join("initrd").exists() {
+        vmlinuz.parent().unwrap_or(Path::new("/")).join("initrd")
     } else {
-        anyhow::bail!("initrd not found");
+        Path::new("/boot").join(&boot_name).join("initrd")
     };
+    let initrd_size = fs::metadata(&initrd)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if initrd_size == 0 {
+        anyhow::bail!(
+            "initrd at {} is 0 bytes — registry extraction may have failed",
+            initrd.display()
+        );
+    }
+    println!("  ✓ initrd is valid ({} bytes)", initrd_size);
     if detect_lvm() {
-        // Quick check: the initrd is a raw cpio archive — look for dm-mod.ko or
-        // lvm-related modules in the cpio listing.
+        // Quick check: the initrd is a raw cpio archive — look for dm-mod.ko.
         let listing = Command::new("cpio")
             .args(["-t"])
             .stdin(fs::File::open(&initrd)?)
@@ -489,34 +550,62 @@ fn verify_migration(verity: &VerityDigest, report: &PreflightReport) -> Result<(
         }
     }
 
-    // 4. Verify BLS entry exists and references real files.
-    let esp_entries = Path::new("/boot/efi/loader/entries");
-    let entries_dir: &Path = if esp_entries.exists() {
-        esp_entries
-    } else {
-        Path::new("/boot/loader/entries")
-    };
+    // 4. Verify BLS entry exists and references composefs.
     let mut found_bls = false;
-    if let Ok(rd) = fs::read_dir(&entries_dir) {
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("bootc_") {
-                let content = fs::read_to_string(entry.path())?;
-                // Verify linux/initrd paths exist or are EFI-style relative.
-                if content.contains("linux ") && content.contains("composefs=") {
-                    println!("  ✓ BLS entry {} references composefs deployment", name);
-                    found_bls = true;
-                    break;
+    for entries_mp in &["/boot/efi/loader/entries", "/efi/loader/entries", "/boot/loader/entries"]
+    {
+        if let Ok(rd) = fs::read_dir(entries_mp) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("bootc_") {
+                    let content = fs::read_to_string(entry.path())?;
+                    if content.contains("linux ") && content.contains("composefs=") {
+                        println!("  ✓ BLS entry {} references composefs deployment", name);
+                        found_bls = true;
+                        break;
+                    }
                 }
             }
         }
+        if found_bls {
+            break;
+        }
     }
     if !found_bls {
-        anyhow::bail!("no composefs BLS entry found in {}", entries_dir.display());
+        anyhow::bail!("no composefs BLS entry found in ESP or /boot");
     }
 
     println!("  ✓ All verification checks passed");
     Ok(())
+}
+
+/// Find the ESP block device (e.g. /dev/vda2) by scanning for the
+/// EFI System Partition type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B).
+fn find_esp_device() -> Option<String> {
+    let output = Command::new("lsblk").args(["-ndo", "NAME,PARTTYPE"]).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2
+            && parts[1].to_lowercase()
+                == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+        {
+            return Some(format!("/dev/{}", parts[0]));
+        }
+    }
+    // Fallback: try partition label (bootc writes "EFI-SYSTEM").
+    let output = Command::new("lsblk")
+        .args(["-ndo", "NAME,PARTLABEL"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("EFI-SYSTEM") || line.contains("EFI") {
+            let name = line.split_whitespace().next()?;
+            return Some(format!("/dev/{}", name));
+        }
+    }
+    None
 }
 
 /// Main migration entry point. Orchestrates all 5 phases.
