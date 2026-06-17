@@ -206,6 +206,7 @@ fn rebuild_initrd_with_lvm_if_needed(
     kver: &str,
     mount_path: &Path,
     initrd_dst: &Path,
+    target_image: &str,
 ) -> Result<Option<String>> {
     let needs_lvm = detect_lvm();
     let needs_xfs = Path::new("/sysroot/composefs-loopback.ext4").exists();
@@ -230,45 +231,56 @@ fn rebuild_initrd_with_lvm_if_needed(
             label, kver, mods.join(" "), initrd_dst.display()
         ))?;
 
-    // Extract Dakota kernel modules from podman cache (EROFS mount returns
-    // zeros for content — the kmod index files read as all zeros, breaking
-    // dracut's module resolution). podman cp gives us real bytes.
-    let kmod_dir = TempDir::new_in("/var/tmp")
-        .context("failed to create kmod extract dir")?;
-    let container_src = format!("/usr/lib/modules/{}", kver);
-    println!("[phase5] extracting Dakota kernel modules via podman cp...");
-    // podman cp copies the directory INTO the destination, so we need
-    // <dest>/lib/modules/ to get <dest>/lib/modules/7.0.7.
-    let kmod_target = kmod_dir.path().join("lib/modules");
-    fs::create_dir_all(&kmod_target)?;
-    let extract = Command::new("sh").arg("-c")
-        .arg(format!(
-            "cid=$(podman create {}) && podman cp \"$cid:{}\" {} && podman rm \"$cid\"",
-            "ghcr.io/projectbluefin/dakota:stable", container_src, kmod_target.display()))
-        .status()
-        .context("failed to extract kernel modules from podman")?;
-    if !extract.success() {
-        anyhow::bail!("podman cp for kernel modules failed");
+    // Try to get kernel modules from the EROFS mount first (fast, no download).
+    // Kernel modules are small files (<1 MB) — well within the EROFS inline
+    // data threshold. Only fall back to registry extraction if the mount
+    // returns zero-filled content (detectable via a magic check).
+    let modules_src = mount_path.join("usr/lib/modules").join(kver);
+    let mut use_kmoddir = false;
+    let mut kmoddir_arg = modules_src.clone();
+    if modules_src.join("kernel").exists() {
+        // Spot-check: read the first 4 bytes of a known .ko to ensure it's
+        // not all zeros (EROFS fallback for large files past inline limit).
+        let test_ko = modules_src.join("kernel/fs/xfs/xfs.ko");
+        if let Ok(data) = fs::read(&test_ko) {
+            if data.len() > 4 && data[..4] != [0u8; 4] {
+                println!("[phase5] using kernel modules from EROFS mount (xfs.ko: {} bytes, non-zero)", data.len());
+                // EROFS mount gives real bytes — use --kmoddir directly.
+                use_kmoddir = true;
+            }
+        }
     }
-    let modules_src = kmod_target.join(kver);
-    // dracut --kmoddir expects the kernel-version directory, which must
-    // contain /lib/modules/ as a parent path.
-    let kmoddir_arg = modules_src.clone();
-    if !modules_src.join("kernel").exists() {
-        anyhow::bail!("podman cp did not produce kernel modules at {}", modules_src.display());
-    }
-    println!("[phase5] extracted {} kernel modules", modules_src.display());
-
-    // Run depmod so dracut can find all module dependencies.
-    let depmod_ok = Command::new("depmod")
-        .args(["-b", kmod_dir.path().to_str().unwrap_or(""), kver])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if depmod_ok {
-        println!("[phase5] ran depmod on extracted kernel modules");
-    } else {
-        eprintln!("[phase5] Warning: depmod failed — dracut may not find all modules");
+    if !use_kmoddir {
+        // EROFS mount returns zeros for these files (they exceed inline
+        // threshold). Extract via podman cp — use containers-storage if
+        // the image is locally cached, otherwise pull from registry.
+        let containers_ref = format!("containers-storage:{}", target_image);
+        let has_local = Command::new("podman")
+            .args(["image", "exists", target_image])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let image_ref = if has_local { &containers_ref } else { target_image };
+        let kmod_dir = TempDir::new_in("/var/tmp")
+            .context("failed to create kmod extract dir")?;
+        let container_src = format!("/usr/lib/modules/{}", kver);
+        println!("[phase5] extracting Dakota kernel modules via podman cp (ref: {})...", image_ref);
+        let kmod_target = kmod_dir.path().join("lib/modules");
+        fs::create_dir_all(&kmod_target)?;
+        let extract = Command::new("sh").arg("-c")
+            .arg(format!(
+                "cid=$(podman create {}) && podman cp \"$cid:{}\" {} && podman rm \"$cid\"",
+                image_ref, container_src, kmod_target.display()))
+            .status()
+            .context("failed to extract kernel modules from podman")?;
+        if !extract.success() {
+            anyhow::bail!("podman cp for kernel modules failed");
+        }
+        kmoddir_arg = kmod_target.join(kver);
+        if !kmoddir_arg.join("kernel").exists() {
+            anyhow::bail!("podman cp did not produce kernel modules at {}", kmoddir_arg.display());
+        }
+        println!("[phase5] extracted {} kernel modules via podman", kmoddir_arg.display());
     }
 
     // Rebuild with dracut for LVM/DM modules.
@@ -1368,7 +1380,7 @@ fn phase5_setup_bootloader(
                 // the LVM-enabled initrd bytes, not the original Dakota initrd.
                 let mut extra_initrd_name: Option<String> = None;
                 if have_initrd {
-                    match rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &esp_initrd) {
+                    match rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &esp_initrd, target_image) {
                         Ok(extra) => { extra_initrd_name = extra; }
                         Err(e) => { eprintln!("[phase5] Warning: initrd rebuild failed: {e:#}"); }
                     }
@@ -1491,7 +1503,7 @@ fn phase5_setup_bootloader(
         let mut extra_initrd_grub: Option<String> = None;
         if have_grub_initrd {
             let grub_initrd = grub_boot_dir.join("initrd");
-            match rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &grub_initrd) {
+            match rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, &grub_initrd, target_image) {
                 Ok(extra) => { extra_initrd_grub = extra; }
                 Err(e) => { eprintln!("[phase5] Warning: initrd rebuild failed: {e:#}"); }
             }
