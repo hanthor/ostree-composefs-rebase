@@ -1676,6 +1676,13 @@ fn phase5_setup_bootloader(
                     }
                 }
 
+                // Flush ESP writes to disk. VFAT doesn't sync automatically
+                // without unmount — and the ESP stays mounted at
+                // /var/tmp/esp-migration for the rest of Phase 5.
+                // Without this, in-VM reads see cached data but the raw disk
+                // (host-side .raw scan) shows zeros for large files like initrd.
+                unsafe { libc::sync(); }
+
                 // Now that vmlinuz + initrd are on the ESP, compute their
                 // boot_digest (sha256(vmlinuz || initrd)) and patch the .origin
                 // file. `bootc status` requires this digest to set soft-reboot
