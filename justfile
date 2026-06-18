@@ -1,5 +1,5 @@
 # OSTree → ComposeFS Migration Tool — just tasks
-# https://github.com/hanthor/ostree-composefs-rebase
+# https://github.com/hanthor/bootc-migrate-composefs
 
 default:
     @just --list
@@ -27,7 +27,7 @@ test-one test_name:
     cargo test {{test_name}} -- --nocapture
 
 # Check compilation without producing binary (fast)
-check:
+cargo-check:
     cargo check
 
 # === E2E Tests ===
@@ -57,7 +57,7 @@ e2e-luks: build test
     sudo -E env PATH="{{env_var_or_default('PATH', '/usr/bin:/usr/sbin:/usr/local/bin')}}" \
       BASE_IMAGE="ghcr.io/projectbluefin/bluefin:lts" \
       TARGET_IMAGE="ghcr.io/projectbluefin/dakota:stable" \
-      DISK_SIZE="20G" \
+      DISK_SIZE="40G" \
       FILESYSTEM="xfs+crypt" \
       ./tests/run-e2e.sh 2>&1 | tee e2e-luks.log
 
@@ -77,7 +77,26 @@ e2e-debug: build
 
 # === Linting ===
 
-# Run all linters (shellcheck, rustfmt, clippy)
+# Run every check CI runs (clippy, rustfmt, unit tests, shellcheck)
+check: clippy fmt-check test lint-shell
+
+# Format all Rust code.
+fmt:
+    cargo fmt --all
+
+# Verify Rust code is formatted (no changes applied).
+fmt-check:
+    cargo fmt --all -- --check
+
+# Run clippy with warnings denied.
+clippy:
+    cargo clippy --all-targets -- -D warnings
+
+# Check dependency licenses and sources with cargo-deny.
+deny:
+    cargo deny check bans sources licenses
+
+# Run all linters (shellcheck, rustfmt, clippy). Retained as an alias for `check`.
 lint: lint-shell lint-rust
 
 # Lint shell scripts with shellcheck (warnings + errors only, skip info/style)
@@ -86,11 +105,7 @@ lint-shell:
     shellcheck --severity=warning tests/run-e2e.sh
 
 # Lint Rust code (format + clippy)
-lint-rust:
-    @echo "=== cargo fmt --check ==="
-    cargo fmt --check
-    @echo "=== cargo clippy ==="
-    cargo clippy -- -D warnings
+lint-rust: fmt-check clippy
 
 # === Interactive E2E Steps ===
 # Run individual phases of the E2E test for debugging and iteration.
