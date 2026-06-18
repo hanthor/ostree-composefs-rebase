@@ -1,55 +1,44 @@
-# AGENTS.md — Testing & Verification Strategy
+# Instructions for AI agents
 
-## Status: XFS composefs migration pipeline complete ✅
+This project follows the conventions of the wider bootc-dev / composefs-rs
+ecosystem. If you are an LLM or an LLM-assisted tool contributing here, follow
+the guidance below.
 
-All fixes validated individually. CI runs on every PR → main.
+## CRITICAL instructions for generating commits
 
-## What's working
+### Signed-off-by
 
-| Component | Status |
-|-----------|--------|
-| Registry /etc extraction | ✅ 132 entries, no EROFS zero-fill |
-| Identity DB supplement | ✅ dbus/messagebus user added |
-| Dangling symlink cleanup | ✅ dbus-broker → dbus.service handled |
-| sysroot-composefs.mount | ✅ persisted in deploy /etc |
-| bootc-composefs-rebind.service | ✅ loopback visible through overlay |
-| BLS entry title | ✅ `Dakota 42 (composefs)` format |
-| Host-side disk scan | ✅ 9 validation checks |
-| dbus after composefs boot | ✅ SSH in ~55s |
-| bootc status | ✅ stale BLS entries cleaned |
-| --version flag | ✅ Git SHA embedded |
+Human review is required for all code that is generated or assisted by a large
+language model. If you are an LLM, you MUST NOT add a `Signed-off-by` trailer to
+automatically generated git commits. Only an explicit human action or request
+should add a `Signed-off-by`. If you open a pull request and the DCO check fails,
+tell the human to review the code and explain how to add a signoff.
 
-## Remaining work
+### Attribution
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| LUKS encryption for E2E | Medium | bootc install --encrypt flag |
-| Commit subcommand | Low | Needs bootc composfs --policy |
-| BTRFS E2E test pass | Low | Should work, not validated recently |
+When generating substantial amounts of code, you SHOULD include an
+`Assisted-by: TOOLNAME (MODELNAME)` trailer. For example,
+`Assisted-by: Claude Code (Opus 4.8)`.
 
-## Two-sided testing
+## Code guidelines
 
-Every E2E run validates migration correctness from **both sides**:
+[REVIEW.md](REVIEW.md) describes expectations around testing, code quality,
+commit messages, and commit organization. After each commit — and especially
+when you believe a task is complete — you are strongly encouraged to review your
+change against those guidelines (a subagent review is a good way to do this),
+alongside looking for any other issues. The same applies when reviewing others'
+code.
 
-| Side | What | Where | Executes |
-|------|------|-------|----------|
-| **In-VM** | `verify_migration()` in the migrator binary | `src/migration/mod.rs` | Inside QEMU, after Phase 5 |
-| **Host-side** | `.raw` disk image scan | `tests/run-e2e.sh` | On the CI/laptop host |
+Key project-specific points (see REVIEW.md for the full list):
 
-## CI matrix
+- Prefer `rustix` over `libc`; `unsafe` is denied via `[lints.rust]` and must be
+  carefully justified if ever reintroduced.
+- Keep parsing separate from I/O so logic stays unit-testable; prefer
+  table-driven tests.
+- Run `just check` (clippy, rustfmt, unit tests, shellcheck) before opening a PR.
 
-| Scenario | Base | Target | Filesystem | --skip-import |
-|----------|------|--------|------------|---------------|
-| btrfs + composefs | bluefin:stable | dakota:stable | btrfs | yes |
-| xfs + loopback | bluefin:lts | dakota:stable | xfs | yes |
-| LUKS + xfs (TODO) | bluefin:lts | dakota:stable | xfs+crypt | yes |
+## Follow other guidelines
 
-## Common failure modes
-
-| Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| `meta.json not found` | EROFS overlay shadows loopback mount | bootc-composefs-rebind.service bind-mounts on top |
-| `bootc status` fails with stale entry | OSTree BLS entry referenced by bootc state | Clean /run/composefs/staged-deployment |
-| `dbus.service` 217/USER | Missing `dbus` user in merged passwd | supplement_identity_dbs_from_registry |
-| `system.conf` not well-formed | EROFS zero-fills past inline threshold | Registry streaming for /etc extraction |
-| Zero-byte initrd on ESP | VFAT writeback cache unsynced | `unsafe { libc::sync() }` |
+Read [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md) and follow
+the contribution guidance there. Current project status and the active
+workstream live in [HANDOFF.md](HANDOFF.md).

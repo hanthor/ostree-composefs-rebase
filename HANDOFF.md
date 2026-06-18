@@ -1,6 +1,6 @@
 # OSTree → ComposeFS Migration Tool — Handoff
 
-**Repository:** `hanthor/ostree-composefs-rebase`  
+**Repository:** `hanthor/bootc-migrate-composefs`  
 **Goal:** In-place migration from OSTree-booted Bluefin:stable to ComposeFS-booted Dakota:stable via systemd-boot  
 **Agent:** pi  
 **Approach:** TDD vertical slices (5 slices)  
@@ -68,7 +68,7 @@ A Bluefin:stable user runs the migration binary once and ends up booted on Dakot
 | sshd 255/EXCEPTION root cause #1: `sshd_config.d/40-redhat-crypto-policies.conf` from Bluefin survived merge, referencing `/etc/crypto-policies/` absent in Dakota | Adopted composefs 3-way merge semantic: `(Some(old), Some(cur), None)` with `old==cur` → drop (system file the target removed) | `9027a5f` |
 | sshd 255/EXCEPTION root cause #2: `sshd.service` enablement symlink from Bluefin survived merge into Dakota deploy /etc, causing port conflict with e2e-sshd.socket | `ensure_e2e_ssh_socket` removes `multi-user.target.wants/sshd.service` symlink in deploy /etc | `4c703d6` |
 | Post-reboot SSH "Permission denied (publickey)" despite injected authorized_keys: `phase4_var_migration` synthesized an `/etc/fstab` entry mounting btrfs subvolid=5 (the root subvol containing `/ostree`, `/state`, `/boot`) at `/var`, shadowing the initramfs bind-mount of `state/os/default/var`. `/root → var/roothome` then resolved to a path that doesn't exist on the running system. Also the subvol branch returned early without copying `/var` data | Removed fstab synthesis from phase 4; always copy `/sysroot/ostree/deploy/default/var → /sysroot/state/os/default/var` so the bootc initramfs bind-mount exposes user state (roothome, home, lib/containers) | TBD (run #2) |
-| Non-btrfs (xfs) OSTree installs not supported | Filed [#16](https://github.com/hanthor/ostree-composefs-rebase/issues/16) | n/a |
+| Non-btrfs (xfs) OSTree installs not supported | Filed [#16](https://github.com/hanthor/bootc-migrate-composefs/issues/16) | n/a |
 | Migration binary not used in E2E (build was from old binary) | E2E uses `cargo build` at start of each run; binary is always fresh | n/a — workflow fix |
 | `sshd` binary at `/usr/bin/sshd`, not `/usr/sbin/sshd` in Bluefin/Dakota | Fixed path in e2e-sshd@.service | `7a10476` |
 | GitHub issues cleanup | Closed 12 implemented issues; filed #15 for config drift GUI | n/a |
@@ -169,7 +169,7 @@ sudo podman push --tls-verify=false 127.0.0.1:5000/dakota:stable
 ### Run
 
 ```bash
-cd /var/home/james/dev/ostree-composefs-rebase && \
+cd /var/home/james/dev/bootc-migrate-composefs && \
 sudo -E env PATH=$PATH \
   BASE_IMAGE=ghcr.io/projectbluefin/bluefin:stable \
   TARGET_IMAGE=ghcr.io/projectbluefin/dakota:stable \
@@ -275,3 +275,65 @@ Bootloader: Will migrate to systemd-boot (ESP ready, NVRAM writable).
 3. **Realistic Bluefin user setup in E2E** — Add a primary `bluefin` user via useradd inside the VM pre-migration, drop `gnome-initial-setup-done` markers, populate dconf/.local/share to mirror a real first-boot state.
 4. **Post-reboot validation** — Verify /var, /etc, /home persistence after successful composefs boot.
 5. **Reconsider prune scope** — current prune only drops symlinks under /usr/* with absent targets. Watch for cases where target is in /opt or /var (rare); broader audit may be needed if other cascades surface.
+
+
+---
+
+# Testing & Verification Strategy
+
+_(Moved from the old `AGENTS.md`, which now holds AI-agent contribution instructions.)_
+
+
+## Status: XFS composefs migration pipeline complete ✅
+
+All fixes validated individually. CI runs on every PR → main.
+
+## What's working
+
+| Component | Status |
+|-----------|--------|
+| Registry /etc extraction | ✅ 132 entries, no EROFS zero-fill |
+| Identity DB supplement | ✅ dbus/messagebus user added |
+| Dangling symlink cleanup | ✅ dbus-broker → dbus.service handled |
+| sysroot-composefs.mount | ✅ persisted in deploy /etc |
+| bootc-composefs-rebind.service | ✅ loopback visible through overlay |
+| BLS entry title | ✅ `Dakota 42 (composefs)` format |
+| Host-side disk scan | ✅ 9 validation checks |
+| dbus after composefs boot | ✅ SSH in ~55s |
+| bootc status | ✅ stale BLS entries cleaned |
+| --version flag | ✅ Git SHA embedded |
+
+## Remaining work
+
+| Item | Priority | Notes |
+|------|----------|-------|
+| LUKS encryption for E2E | Medium | bootc install --encrypt flag |
+| Commit subcommand | Low | Needs bootc composfs --policy |
+| BTRFS E2E test pass | Low | Should work, not validated recently |
+
+## Two-sided testing
+
+Every E2E run validates migration correctness from **both sides**:
+
+| Side | What | Where | Executes |
+|------|------|-------|----------|
+| **In-VM** | `verify_migration()` in the migrator binary | `src/migration/mod.rs` | Inside QEMU, after Phase 5 |
+| **Host-side** | `.raw` disk image scan | `tests/run-e2e.sh` | On the CI/laptop host |
+
+## CI matrix
+
+| Scenario | Base | Target | Filesystem | --skip-import |
+|----------|------|--------|------------|---------------|
+| btrfs + composefs | bluefin:stable | dakota:stable | btrfs | yes |
+| xfs + loopback | bluefin:lts | dakota:stable | xfs | yes |
+| LUKS + xfs (TODO) | bluefin:lts | dakota:stable | xfs+crypt | yes |
+
+## Common failure modes
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `meta.json not found` | EROFS overlay shadows loopback mount | bootc-composefs-rebind.service bind-mounts on top |
+| `bootc status` fails with stale entry | OSTree BLS entry referenced by bootc state | Clean /run/composefs/staged-deployment |
+| `dbus.service` 217/USER | Missing `dbus` user in merged passwd | supplement_identity_dbs_from_registry |
+| `system.conf` not well-formed | EROFS zero-fills past inline threshold | Registry streaming for /etc extraction |
+| Zero-byte initrd on ESP | VFAT writeback cache unsynced | `unsafe { libc::sync() }` |
