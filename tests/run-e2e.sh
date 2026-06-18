@@ -354,15 +354,10 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     fi
     echo "[luks] deploy root: $DEPLOY_ROOT"
 
-    # crypttab + keyfile on the installed system
-    LUKS_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
-    # Make the target writable (bootc install leaves it read-only)
-    echo "[luks] remounting target rw..."
-    sudo blockdev --setrw /dev/mapper/"$LUKS_MAPPER" 2>&1 || echo "[luks] blockdev failed: $?"
-    sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>&1 || echo "[luks] remount failed: $?"
-    sudo mkdir -p "$DEPLOY_ROOT/etc" "$DEPLOY_ROOT/keys" 2>&1 || echo "[luks] mkdir failed: $?"
-    echo "$LUKS_MAPPER UUID=$LUKS_UUID /keys/luks.key luks" | sudo tee "$DEPLOY_ROOT/etc/crypttab"
-    sudo cp "$LUKS_KEYFILE" "$DEPLOY_ROOT/keys/luks.key"
+    # Keyfile already on ESP (copied during ESP format step above).
+    # BLS entry already has rd.luks.key + rd.luks.name from the loop below.
+    # No crypttab needed: systemd-cryptsetup uses rd.luks.key= kernel arg
+    # to find the keyfile on the ESP during early boot.
 
     # Add rd.luks kernel args to BLS entries
     for bls in /tmp/mnt-e2e-luks-root/boot/loader/entries/ostree-*.conf; do
