@@ -373,8 +373,17 @@ else
 fi
 
 # Force kernel to reread partition table by detaching and re-attaching
-echo "Cycling loop device to refresh partitions..."
-sudo losetup -d "$LOOP_DEV"
+if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+    echo "LUKS mode: skipping loop cycle and SSH injection (root is encrypted)"
+    # LUKS root is inaccessible from host; SSH key was injected by
+    # bootc install to-disk --root-ssh-authorized-keys
+    # Skip injection/fixtures/BLS steps: jump to OVMF setup
+fi
+
+if [ "$FILESYSTEM" != "xfs+crypt" ]; then
+    echo "Cycling loop device to refresh partitions..."
+fi
+sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
 LOOP_DEV=$(sudo losetup --show -f -P disk.raw)
 echo "Re-attached loop device: $LOOP_DEV"
 
