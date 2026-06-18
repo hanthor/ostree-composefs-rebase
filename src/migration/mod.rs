@@ -83,12 +83,7 @@ pub fn run_migration(
     bootloader: &str,
     force: bool,
 ) -> Result<()> {
-    // Stamp the disk with the build version for post-mortem diagnostics.
-    let version = env!("BUILD_GIT_HASH");
-    if let Err(e) = fs::write("/e2e-disk-label.txt", format!("bootc-migrate-composefs {}\n", version))
-    {
-        eprintln!("Warning: could not write disk version label: {e:#}");
-    }
+    let _version = env!("BUILD_GIT_HASH");
     // Acquire exclusive lock (Fix 8).
     let _lock = if !dry_run {
         Some(acquire_lock()?)
@@ -122,6 +117,15 @@ pub fn run_migration(
         }
     } else {
         println!("[DRY RUN] Would remount /sysroot and /boot read-write.");
+    }
+
+    // Stamp disk with migration binary version (after remount rw so the
+    // write succeeds on OSTree systems that boot /sysroot read-only).
+    if !dry_run {
+        let stamp = format!("bootc-migrate-composefs {}\n", env!("BUILD_GIT_HASH"));
+        if let Err(e) = fs::write("/e2e-disk-label.txt", stamp) {
+            eprintln!("Warning: could not write disk version label: {e:#}");
+        }
     }
 
     // ---- Phase 0: preflight free-space check (#10) ----

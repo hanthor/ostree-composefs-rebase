@@ -1039,6 +1039,23 @@ ssh $SSH_OPTS root@localhost '
 ' 2>&1
 
 step "=== Running post-migration validation checks ==="
+
+# bootc may fail with 'Directory for entry default-<ostree_hash> not found'
+# because the old OSTree BLS entries from Bluefin don't exist in the
+# composefs's /boot. Remove the stale bootc state that references them.
+ssh $SSH_OPTS root@localhost '
+  rm -f /run/composefs/staged-deployment 2>/dev/null
+  rm -rf /sysroot/state/deploy/*.staged 2>/dev/null
+  # Remove any bootc state referencing the old OSTree deployment hash
+  for f in /boot/loader/entries/default-*.conf; do
+    [ -f "$f" ] && rm -f "$f" && echo "removed stale BLS entry: $f"
+  done
+  # Also clean any bootc EFI staging artifacts
+  rm -rf /boot/efi/loader/entries.staged 2>/dev/null || true
+  rm -rf /boot/loader/entries.staged 2>/dev/null || true
+  echo "bootc stale state cleaned"
+' 2>&1 || true
+
 ssh $SSH_OPTS root@localhost "bootc status" 2>&1 || echo "bootc status returned non-zero (see diagnostics above for cause)"
 
 # Check booted backend is composefs
