@@ -321,11 +321,6 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     sudo mkdir -p /tmp/mnt-e2e-luks-root
     sudo mount /dev/mapper/"$LUKS_MAPPER" /tmp/mnt-e2e-luks-root
 
-    # Create /etc and /keys directories BEFORE bootc install (they persist
-    # through the OSTree layer and remain writable on the ext4 filesystem).
-    sudo mkdir -p /tmp/mnt-e2e-luks-root/etc /tmp/mnt-e2e-luks-root/keys
-    sudo chmod 755 /tmp/mnt-e2e-luks-root/etc /tmp/mnt-e2e-luks-root/keys
-
     # Format ESP
     sudo mkfs.vfat -F 32 -n EFI-SYSTEM "$ESP_PART"
     sudo mkdir -p /tmp/mnt-e2e-luks-esp
@@ -361,15 +356,12 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
 
     # crypttab + keyfile on the installed system
     LUKS_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
-    # Write via podman container (target fs is read-only from host after bootc install)
-    sudo podman run --rm --privileged -v /tmp/mnt-e2e-luks-root:/target \
-        "$INSTALL_IMAGE" bash -c '\
-          d="$(ls -d /target/ostree/deploy/default/deploy/*.0 2>/dev/null | head -1)"; \
-          mkdir -p "$d/etc" "$d/keys" /target/keys 2>/dev/null; \
-          echo "$LUKS_MAPPER UUID=$LUKS_UUID /keys/luks.key luks" > "$d/etc/crypttab"; \
-          cp "$LUKS_KEYFILE" /target/keys/luks.key 2>/dev/null; \
-          cp "$d/etc/crypttab" /target/etc/crypttab 2>/dev/null; \
-          echo "crypttab written"' 2>&1 || true
+    # Make the target writable (bootc leaves it read-only)
+    sudo blockdev --setrw /dev/mapper/"$LUKS_MAPPER" 2>/dev/null || true
+    sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>/dev/null || true
+    sudo mkdir -p "$DEPLOY_ROOT/etc" "$DEPLOY_ROOT/keys"
+    echo "$LUKS_MAPPER UUID=$LUKS_UUID /keys/luks.key luks" | sudo tee "$DEPLOY_ROOT/etc/crypttab"
+    sudo cp "$LUKS_KEYFILE" "$DEPLOY_ROOT/keys/luks.key"
 
     # Add rd.luks kernel args to BLS entries
     for bls in /tmp/mnt-e2e-luks-root/boot/loader/entries/ostree-*.conf; do
