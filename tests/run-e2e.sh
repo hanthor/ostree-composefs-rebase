@@ -585,7 +585,9 @@ fi
 # upstream brew builds don't include it) and pad it to 4 MB to match the CODE
 # pflash size. Cache the prepared file under workspace/ovmf_vars.fd.
 OVMF_VARS="$WORKSPACE_DIR/ovmf_vars.fd"
-if [ ! -f "$OVMF_VARS" ] || [ "$SKIP_SETUP" = false ]; then
+# Always create fresh OVMF vars for full setup runs (NVRAM fills up with
+# EFI boot entries from repeated installs). On checkpoint restore, reuse.
+if [ "$SKIP_SETUP" = false ] || [ ! -f "$OVMF_VARS" ]; then
     sudo cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
     sudo chown "$(id -u):$(id -g)" "$OVMF_VARS"
     chmod u+w "$OVMF_VARS"
