@@ -356,10 +356,11 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
 
     # crypttab + keyfile on the installed system
     LUKS_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
-    # Make the target writable (bootc leaves it read-only)
-    sudo blockdev --setrw /dev/mapper/"$LUKS_MAPPER" 2>/dev/null || true
-    sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>/dev/null || true
-    sudo mkdir -p "$DEPLOY_ROOT/etc" "$DEPLOY_ROOT/keys"
+    # Make the target writable (bootc install leaves it read-only)
+    echo "[luks] remounting target rw..."
+    sudo blockdev --setrw /dev/mapper/"$LUKS_MAPPER" 2>&1 || echo "[luks] blockdev failed: $?"
+    sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>&1 || echo "[luks] remount failed: $?"
+    sudo mkdir -p "$DEPLOY_ROOT/etc" "$DEPLOY_ROOT/keys" 2>&1 || echo "[luks] mkdir failed: $?"
     echo "$LUKS_MAPPER UUID=$LUKS_UUID /keys/luks.key luks" | sudo tee "$DEPLOY_ROOT/etc/crypttab"
     sudo cp "$LUKS_KEYFILE" "$DEPLOY_ROOT/keys/luks.key"
 
