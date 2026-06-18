@@ -15,3 +15,10 @@ test_key.pub
 disk.raw
 qemu.log
 disk.raw.pre-migration
+
+# E2E test artifacts
+*.raw
+*.raw.*
+e2e-*.log
+qemu.log
+serial-*.log

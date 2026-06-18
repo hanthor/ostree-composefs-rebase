@@ -1,5 +1,5 @@
+use anyhow::{Context, Result};
 use std::fs;
-use anyhow::{Result, Context};
 
 /// Build kernel command-line options for the ComposeFS boot entry.
 ///
@@ -14,11 +14,14 @@ use anyhow::{Result, Context};
 /// - `rootflags=*` — often specific to the OSTree btrfs subvol
 /// - `rd.systemd.unit=*` — stay out of initrd overrides
 pub fn get_kernel_options(composefs_digest: &str) -> Result<String> {
-    let cmdline = fs::read_to_string("/proc/cmdline")
-        .context("failed to read /proc/cmdline")?;
+    let cmdline = fs::read_to_string("/proc/cmdline").context("failed to read /proc/cmdline")?;
     let mut options: Vec<String> = Vec::new();
     for word in cmdline.split_whitespace() {
         if should_filter(word) {
+            continue;
+        }
+        // Strip quiet/rhgb so emergency-mode console output is visible.
+        if word == "quiet" || word == "rhgb" {
             continue;
         }
         options.push(word.to_string());
@@ -27,6 +30,10 @@ pub fn get_kernel_options(composefs_digest: &str) -> Result<String> {
     // SPECIFICATION.md §3.4 and §4.2 examples use the bare hex form.
     let bare_hex = crate::VerityDigest::from_prefixed_or_hex(composefs_digest);
     options.push(format!("composefs={}", bare_hex.as_hex()));
+    // Temporary: forward journal to console for debugging emergency mode.
+    options.push("systemd.log_level=debug".into());
+    options.push("systemd.log_target=console".into());
+    options.push("systemd.journald.forward_to_console=1".into());
     Ok(options.join(" "))
 }
 
@@ -34,9 +41,14 @@ fn should_filter(word: &str) -> bool {
     if word.starts_with("ostree=")
         || word.starts_with("BOOT_IMAGE=")
         || word.starts_with("initrd=")
-        || word.starts_with("rootflags=")
         || word.starts_with("rd.systemd.unit=")
     {
+        return true;
+    }
+    // Only filter rootflags that contain subvol= — btrfs-specific subvolume
+    // assignments are meaningless on composefs. Non-subvol rootflags (e.g.
+    // XFS mount options passed by the initramfs) are preserved.
+    if word.starts_with("rootflags=") && word.contains("subvol=") {
         return true;
     }
     // Also filter anything starting with "ostree." — belt and suspenders.
@@ -103,21 +115,24 @@ mod tests {
     #[test]
     fn preserves_root_arg() {
         // Fix 7: root= is needed alongside composefs= per SPECIFICATION.md §4.2.
-        let result = build_options(
-            "root=UUID=aaaa-bbbb quiet rw",
-            "ab01cd23ef45",
-        );
+        let result = build_options("root=UUID=aaaa-bbbb quiet rw", "ab01cd23ef45");
         assert!(result.contains("root=UUID=aaaa-bbbb"));
         assert!(result.contains("quiet"));
     }
 
     #[test]
-    fn filters_rootflags_arg() {
-        let result = build_options(
-            "rootflags=subvol=root quiet rw",
-            "ab01cd23ef45",
-        );
+    fn filters_rootflags_subvol() {
+        // rootflags containing subvol= (btrfs-specific) are filtered.
+        let result = build_options("rootflags=subvol=root quiet rw", "ab01cd23ef45");
         assert!(!result.contains("rootflags="));
+        assert!(result.contains("quiet"));
+    }
+
+    #[test]
+    fn preserves_rootflags_without_subvol() {
+        // rootflags without subvol= (e.g. XFS, ext4 mount options) are kept.
+        let result = build_options("rootflags=defaults quiet rw", "ab01cd23ef45");
+        assert!(result.contains("rootflags=defaults"));
         assert!(result.contains("quiet"));
     }
 
@@ -133,20 +148,14 @@ mod tests {
 
     #[test]
     fn filters_ostree_dot_prefix_args() {
-        let result = build_options(
-            "ostree.booted=1 ostree.composefs=0 quiet",
-            "ab01cd23ef45",
-        );
+        let result = build_options("ostree.booted=1 ostree.composefs=0 quiet", "ab01cd23ef45");
         assert!(!result.contains("ostree."));
         assert!(result.contains("quiet"));
     }
 
     #[test]
     fn preserves_console_args() {
-        let result = build_options(
-            "console=ttyS0,115200n8 console=tty0 quiet",
-            "ab01cd23ef45",
-        );
+        let result = build_options("console=ttyS0,115200n8 console=tty0 quiet", "ab01cd23ef45");
         assert!(result.contains("console=ttyS0,115200n8"));
         assert!(result.contains("console=tty0"));
     }

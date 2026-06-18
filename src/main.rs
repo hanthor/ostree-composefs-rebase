@@ -1,22 +1,23 @@
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use anyhow::{Result, anyhow, Context};
 use std::path::{Path, PathBuf};
 use std::process;
 
-mod reflink;
-mod preflight;
-mod ostree;
 mod composefs;
+mod mergetc;
 mod migration;
+mod ostree;
+mod preflight;
+mod reflink;
 mod types;
 mod xattr;
-mod mergetc;
 
 pub use types::VerityDigest;
 
 #[derive(Parser, Debug)]
 #[command(name = "bootc-migrate-composefs")]
 #[command(about = "In-place migration utility from OSTree backend to ComposeFS backend", long_about = None)]
+#[command(version = env!("BUILD_GIT_HASH"))]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -62,12 +63,30 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Undo a partial or failed migration — remove composefs boot artifacts
+    /// and staged deployments while preserving the composefs object store.
+    ///
+    /// Removes staged deployments, boot artifacts, BLS entries from ESP.
+    /// Does NOT touch the composefs object store or loopback image — those
+    /// are expensive to rebuild and survive across retries. Use --full for
+    /// complete cleanup including the object store.
+    #[command(name = "undo")]
+    Undo {
+        /// Preview what would be removed; touch nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Full cleanup: also remove composefs object store and loopback image.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn check_root_privilege() -> Result<()> {
     let uid = unsafe { libc::getuid() };
     if uid != 0 {
-        return Err(anyhow!("This command must be run as root (e.g., using sudo)."));
+        return Err(anyhow!(
+            "This command must be run as root (e.g., using sudo)."
+        ));
     }
     Ok(())
 }
@@ -75,9 +94,72 @@ fn check_root_privilege() -> Result<()> {
 fn main() {
     let args = Args::parse();
 
+    // Open persistent log file — all migration output is tee'd here so the
+    // user can inspect results even if the terminal session is lost.
+    let log_path = "/var/log/bootc-migrate-composefs.log";
+    let log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(f) => {
+            eprintln!("Logging migration output to {}", log_path);
+            Some(f)
+        }
+        Err(e) => {
+            eprintln!("Warning: could not open log file {}: {}", log_path, e);
+            None
+        }
+    };
+
+    // Tee stdout+stderr to log file via a pipe so output is visible both
+    // on the terminal (over SSH for E2E) and in the persistent log.
+    if let Some(log_file) = log_file {
+        use std::os::unix::io::FromRawFd;
+        let mut pipe_fds = [-1i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0 {
+            let pipe_read = pipe_fds[0];
+            let pipe_write = pipe_fds[1];
+            // Save original stdout fd so the tee thread can write to the
+            // real terminal even after we dup2 the pipe over stdout/stderr.
+            let orig_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_read) };
+                let mut stdout = unsafe { std::fs::File::from_raw_fd(orig_stdout) };
+                let mut log = log_file;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let _ = log.write_all(&buf[..n]);
+                            let _ = stdout.write_all(&buf[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            unsafe {
+                libc::dup2(pipe_write, libc::STDOUT_FILENO);
+                libc::dup2(pipe_write, libc::STDERR_FILENO);
+                libc::close(pipe_write);
+            }
+        }
+    }
+
     // Handle --commit subcommand (#8)
     if let Some(Command::Commit { dry_run }) = args.command {
         if let Err(e) = run_commit(dry_run) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
+    // Handle --undo subcommand
+    if let Some(Command::Undo { dry_run, full }) = args.command {
+        if let Err(e) = run_undo(dry_run, full) {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -100,7 +182,8 @@ fn main() {
         process::exit(1);
     }
 
-    println!("=== OSTree to ComposeFS Migration Utility ===");
+    let version = env!("BUILD_GIT_HASH");
+    println!("=== OSTree to ComposeFS Migration Utility v{} ===", version);
     if args.dry_run {
         println!("*** DRY RUN MODE — no changes will be made ***");
     }
@@ -135,25 +218,83 @@ fn main() {
     };
 
     // Output preflight details
-    println!("  - Booted OSTree backend: {}", if report.is_bootc_ostree { "Yes" } else { "No" });
-    println!("  - UEFI Boot Mode:        {}", if report.is_uefi { "Yes" } else { "No (Legacy BIOS)" });
-    println!("  - NVRAM writable:        {}", if report.nvram_writable { "Yes" } else { "No" });
-    println!("  - ESP Mounted Path:      {}", report.esp_path.as_deref().unwrap_or("None — GRUB2-only migration"));
+    println!(
+        "  - Booted OSTree backend: {}",
+        if report.is_bootc_ostree { "Yes" } else { "No" }
+    );
+    println!(
+        "  - UEFI Boot Mode:        {}",
+        if report.is_uefi {
+            "Yes"
+        } else {
+            "No (Legacy BIOS)"
+        }
+    );
+    println!(
+        "  - NVRAM writable:        {}",
+        if report.nvram_writable { "Yes" } else { "No" }
+    );
+    println!(
+        "  - ESP Mounted Path:      {}",
+        report
+            .esp_path
+            .as_deref()
+            .unwrap_or("None — GRUB2-only migration")
+    );
     if let Some(ref fs) = report.esp_fs_type {
         println!("  - ESP Filesystem:        {}", fs);
     }
-    println!("  - ESP Free Space:        {:.2} MB", report.esp_free_space_bytes as f64 / (1024.0 * 1024.0));
-    println!("  - Filesystem:            {}", report.fs_type.as_deref().unwrap_or("unknown"));
-    println!("  - Btrfs Filesystem:      {}", if report.is_btrfs { "Yes" } else { "No" });
+    println!(
+        "  - ESP Free Space:        {:.2} MB",
+        report.esp_free_space_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  - Filesystem:            {}",
+        report.fs_type.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  - Btrfs Filesystem:      {}",
+        if report.is_btrfs { "Yes" } else { "No" }
+    );
     if report.sysroot_was_ro {
         println!("  - /sysroot was RO:       Yes (remounted rw for reflink test)");
     }
-    println!("  - Reflink (CoW) Support: {}", if report.supports_reflink { "Yes" } else { "No" });
-    println!("  - OSTree repo size:      {:.2} GB", report.ostree_repo_size_bytes as f64 / 1e9);
-    println!("  - ComposeFS free space:  {:.2} GB", report.composefs_free_bytes as f64 / 1e9);
-    println!("  - GRUB tools available:  {}", if report.grub_tools_available { "Yes" } else { "No" });
-    println!("  - ESP ready for sd-boot: {}", if report.esp_ready_for_systemd_boot { "Yes (>=150 MB)" } else { "No" });
-    println!("  - systemd-boot binaries: {}", if report.systemd_boot_binaries_present { "Yes (/usr/lib/systemd/boot/efi)" } else { "No (bootctl install would fail)" });
+    println!(
+        "  - Reflink (CoW) Support: {}",
+        if report.supports_reflink { "Yes" } else { "No" }
+    );
+    println!(
+        "  - OSTree repo size:      {:.2} GB",
+        report.ostree_repo_size_bytes as f64 / 1e9
+    );
+    println!(
+        "  - ComposeFS free space:  {:.2} GB",
+        report.composefs_free_bytes as f64 / 1e9
+    );
+    println!(
+        "  - GRUB tools available:  {}",
+        if report.grub_tools_available {
+            "Yes"
+        } else {
+            "No"
+        }
+    );
+    println!(
+        "  - ESP ready for sd-boot: {}",
+        if report.esp_ready_for_systemd_boot {
+            "Yes (>=150 MB)"
+        } else {
+            "No"
+        }
+    );
+    println!(
+        "  - systemd-boot binaries: {}",
+        if report.systemd_boot_binaries_present {
+            "Yes (/usr/lib/systemd/boot/efi)"
+        } else {
+            "No (bootctl install would fail)"
+        }
+    );
     println!();
 
     // Migration readiness summary
@@ -166,7 +307,8 @@ fn main() {
         issues.push("Legacy BIOS boot detected — systemd-boot unavailable; will stay on GRUB2.");
     }
     if report.is_uefi && !report.nvram_writable {
-        issues.push("UEFI NVRAM not writable — efibootmgr may fail; systemd-boot may not register.");
+        issues
+            .push("UEFI NVRAM not writable — efibootmgr may fail; systemd-boot may not register.");
     }
     if !report.esp_detected {
         issues.push("No ESP found — systemd-boot unavailable; will use GRUB2.");
@@ -178,14 +320,19 @@ fn main() {
         issues.push("systemd-boot binaries missing in source OS — migration will extract them from the target image instead.");
     }
     if !report.grub_tools_available {
-        issues.push("No GRUB tools (grub2-reboot, grub2-editenv) — one-shot boot selection may fail.");
+        issues.push(
+            "No GRUB tools (grub2-reboot, grub2-editenv) — one-shot boot selection may fail.",
+        );
     }
     if !report.supports_reflink {
         issues.push("No reflink support — object copies will use 1.5× more disk space.");
     }
-    let has_free_space = report.composefs_free_bytes as f64 > (report.ostree_repo_size_bytes as f64 * 1.5);
+    let has_free_space =
+        report.composefs_free_bytes as f64 > (report.ostree_repo_size_bytes as f64 * 1.5);
     if !has_free_space && report.ostree_repo_size_bytes > 0 {
-        issues.push("Insufficient free space for migration — need >=1.5× repo size (without reflink).");
+        issues.push(
+            "Insufficient free space for migration — need >=1.5× repo size (without reflink).",
+        );
     }
 
     if issues.is_empty() {
@@ -206,7 +353,9 @@ fn main() {
         println!("\nBootloader: Will stay on GRUB2 (BLS Type 1).");
         if !report.grub_tools_available {
             println!("  WARNING: grub2-reboot not found. Boot selection may not work.");
-            println!("  The composefs entry will be written but you may need to select it manually");
+            println!(
+                "  The composefs entry will be written but you may need to select it manually"
+            );
             println!("  from the GRUB menu on next boot.");
         }
     } else {
@@ -215,12 +364,16 @@ fn main() {
 
     // Validate requirements
     if !report.is_bootc_ostree && !args.force {
-        eprintln!("Error: System is not booted into an OSTree deployment. Cannot perform migration.");
+        eprintln!(
+            "Error: System is not booted into an OSTree deployment. Cannot perform migration."
+        );
         process::exit(1);
     }
 
     if !report.supports_reflink && !args.force {
-        println!("Warning: Reflink support not detected on /sysroot. Migration will perform a full copy of repository objects, which will require significant disk space.");
+        println!(
+            "Warning: Reflink support not detected on /sysroot. Migration will perform a full copy of repository objects, which will require significant disk space."
+        );
         print!("Do you want to proceed anyway? (y/N): ");
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() {
@@ -236,7 +389,14 @@ fn main() {
     }
 
     println!("Starting migration to OCI image: {}...", target_image);
-    if let Err(e) = migration::run_migration(&report, &target_image, args.dry_run, args.skip_import, &args.bootloader, args.force) {
+    if let Err(e) = migration::run_migration(
+        &report,
+        &target_image,
+        args.dry_run,
+        args.skip_import,
+        &args.bootloader,
+        args.force,
+    ) {
         eprintln!("\nMigration Failed: {:#}", e);
         process::exit(1);
     }
@@ -273,7 +433,8 @@ fn run_commit(dry_run: bool) -> Result<()> {
             // Check if there are bootc_ entries on the ESP.
             if let Ok(mut rd) = std::fs::read_dir(&esp_entries) {
                 if rd.any(|e| {
-                    e.map(|en| en.file_name().to_string_lossy().starts_with("bootc_")).unwrap_or(false)
+                    e.map(|en| en.file_name().to_string_lossy().starts_with("bootc_"))
+                        .unwrap_or(false)
                 }) {
                     entries_dir = esp_entries;
                     is_systemd_boot = true;
@@ -303,7 +464,9 @@ fn run_commit(dry_run: bool) -> Result<()> {
     if composefs_entries.is_empty() {
         if is_systemd_boot {
             println!("No composefs BLS entries found on ESP. Nothing to commit.");
-            println!("Note: for systemd-boot, the composefs entry should already be the default if it has the lowest sort-key.");
+            println!(
+                "Note: for systemd-boot, the composefs entry should already be the default if it has the lowest sort-key."
+            );
         } else {
             println!("No composefs BLS entries found. Nothing to commit.");
         }
@@ -341,7 +504,10 @@ fn run_commit(dry_run: bool) -> Result<()> {
                     .with_context(|| format!("failed to rewrite {}", loader_conf.display()))?;
             }
         }
-        println!("Composefs deployment '{}' committed as the permanent systemd-boot default.", primary);
+        println!(
+            "Composefs deployment '{}' committed as the permanent systemd-boot default.",
+            primary
+        );
     } else {
         if !dry_run {
             let status = std::process::Command::new("grub2-set-default")
@@ -354,7 +520,10 @@ fn run_commit(dry_run: bool) -> Result<()> {
             let _ = std::fs::remove_file("/boot/loader/entries/ostree-fallback-0.conf");
             let _ = std::fs::remove_dir_all("/boot/ostree-fallback");
         }
-        println!("Composefs deployment '{}' is now the permanent default.", primary);
+        println!(
+            "Composefs deployment '{}' is now the permanent default.",
+            primary
+        );
     }
 
     // --- Full OSTree-side cleanup so the on-disk layout matches a fresh
@@ -379,11 +548,7 @@ fn run_commit(dry_run: bool) -> Result<()> {
     //    operate through that; otherwise fall back to the direct path.
     let ostree_label = "OSTree object store + deploys (incl. leaked pre-migration /var)";
     if has_alt_mount {
-        total_freed += remove_path_with_size(
-            &alt_root.join("ostree"),
-            ostree_label,
-            dry_run,
-        );
+        total_freed += remove_path_with_size(&alt_root.join("ostree"), ostree_label, dry_run);
         // .bootc-aleph.json also through the alt mount for a clean delete.
         total_freed += remove_path_with_size(
             &alt_root.join(".bootc-aleph.json"),
@@ -391,11 +556,7 @@ fn run_commit(dry_run: bool) -> Result<()> {
             dry_run,
         );
     } else {
-        total_freed += remove_path_with_size(
-            Path::new("/sysroot/ostree"),
-            ostree_label,
-            dry_run,
-        );
+        total_freed += remove_path_with_size(Path::new("/sysroot/ostree"), ostree_label, dry_run);
     }
     // .bootc-aleph.json — via alt mount if available, otherwise direct.
     if !has_alt_mount {
@@ -425,14 +586,31 @@ fn run_commit(dry_run: bool) -> Result<()> {
     // 3. When we migrated to systemd-boot, drop the GRUB2 bits the user no
     //    longer needs. Keep them when --bootloader grub2 was used.
     if is_systemd_boot {
-        for path in &[
-            "/boot/grub2",
-            "/boot/efi/EFI/fedora",
-        ] {
+        for path in &["/boot/grub2", "/boot/efi/EFI/fedora"] {
             total_freed += remove_path_with_size(
                 Path::new(path),
                 "GRUB2 boot artifacts (migrated to systemd-boot)",
                 dry_run,
+            );
+        }
+    }
+
+    // 4. Drop ostree-remount.service enablement. On a composefs-booted
+    //    system OSTree bind mounts are irrelevant; the symlink may be
+    //    re-created during boot by the target image's presets even though
+    //    Phase 4 removed it from the deploy /etc.
+    let remount_link =
+        Path::new("/etc/systemd/system/local-fs.target.wants/ostree-remount.service");
+    if remount_link.exists() || remount_link.is_symlink() {
+        if dry_run {
+            println!(
+                "[DRY RUN] Would remove ostree-remount.service enablement (composefs doesn't need OSTree bind mounts)."
+            );
+        } else {
+            std::fs::remove_file(remount_link)
+                .with_context(|| format!("failed to remove {}", remount_link.display()))?;
+            println!(
+                "Removed ostree-remount.service enablement (composefs doesn't need OSTree bind mounts)."
             );
         }
     }
@@ -443,8 +621,14 @@ fn run_commit(dry_run: bool) -> Result<()> {
         println!("Re-run without --dry-run to apply.");
     } else {
         println!("\nReclaimed: {} ({} bytes)", human, total_freed);
-        println!("On-disk layout is now consistent with a fresh '{}' install.",
-                 if is_systemd_boot { "systemd-boot" } else { "GRUB2" });
+        println!(
+            "On-disk layout is now consistent with a fresh '{}' install.",
+            if is_systemd_boot {
+                "systemd-boot"
+            } else {
+                "GRUB2"
+            }
+        );
     }
     if has_alt_mount {
         let _ = std::process::Command::new("umount").arg(alt_root).status();
@@ -483,7 +667,12 @@ fn remove_path_with_size(path: &Path, label: &str, dry_run: bool) -> u64 {
     let size = dir_size(path);
     let human = format_bytes(size);
     if dry_run {
-        println!("[dry-run] would remove {} — {} ({})", path.display(), label, human);
+        println!(
+            "[dry-run] would remove {} — {} ({})",
+            path.display(),
+            label,
+            human
+        );
         return size;
     }
     let res = if meta.is_dir() && !meta.file_type().is_symlink() {
@@ -546,8 +735,7 @@ fn format_bytes(n: u64) -> String {
 /// mutated directly on the underlying filesystem. Works on btrfs, xfs,
 /// and any other filesystem that can be mounted twice.
 fn mount_sysroot_btrfs_at(target: &Path) -> Result<()> {
-    let mounts = std::fs::read_to_string("/proc/mounts")
-        .context("failed to read /proc/mounts")?;
+    let mounts = std::fs::read_to_string("/proc/mounts").context("failed to read /proc/mounts")?;
     let device = mounts
         .lines()
         .find(|line| {
@@ -565,6 +753,203 @@ fn mount_sysroot_btrfs_at(target: &Path) -> Result<()> {
         .context("failed to execute mount for alt-root cleanup")?;
     if !status.success() {
         anyhow::bail!("mount {} → {} failed", device, target.display());
+    }
+    Ok(())
+}
+
+/// Undo a partial or failed migration. Removes all composefs artifacts
+/// (staged deployments, boot artifacts, BLS entries, loopback images,
+/// composefs object store) while leaving the OSTree deployment intact.
+fn run_undo(dry_run: bool, full: bool) -> Result<()> {
+    check_root_privilege()?;
+
+    // Always release the migration lock so a subsequent run doesn't fail
+    // with "already running". The lock guard drops automatically at process
+    // exit, but if the previous run crashed mid-phase the lock can linger.
+    let lock_path = "/var/run/bootc-migrate-composefs.lock";
+    if !dry_run {
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    println!("=== Undoing composefs migration ===");
+    if dry_run {
+        println!("*** DRY RUN — no changes will be made ***");
+    }
+
+    let mut removed = 0usize;
+    let mut skipped = 0usize;
+
+    // 1. Remove staged composefs deployments.
+    let deploy_dir = Path::new("/sysroot/state/deploy");
+    if deploy_dir.exists() {
+        if let Ok(rd) = std::fs::read_dir(deploy_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // Skip the OSTree deploy dir (numeric or short names).
+                // Composefs deploy dirs are long hex strings (64+ chars).
+                if name.len() < 40 {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    println!("Removing staged deployment: {}", path.display());
+                    if !dry_run {
+                        std::fs::remove_dir_all(&path)
+                            .with_context(|| format!("failed to remove {}", path.display()))?;
+                    }
+                    removed += 1;
+                }
+            }
+        }
+    }
+    if removed == 0 {
+        println!("No composefs deployments found in /sysroot/state/deploy/.");
+    }
+
+    // 2. Remove composefs boot artifacts.
+    let boot_dir = Path::new("/boot");
+    if let Ok(rd) = std::fs::read_dir(boot_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("bootc_composefs-") {
+                let path = entry.path();
+                println!("Removing boot artifacts: {}", path.display());
+                if !dry_run {
+                    std::fs::remove_dir_all(&path)
+                        .with_context(|| format!("failed to remove {}", path.display()))?;
+                }
+                removed += 1;
+            }
+        }
+    }
+
+    // 3. Remove composefs BLS entries from /boot/loader/entries.
+    let bls_dir = Path::new("/boot/loader/entries");
+    if bls_dir.exists() {
+        if let Ok(rd) = std::fs::read_dir(bls_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("bootc_") || name.starts_with("ostree-fallback-") {
+                    let path = entry.path();
+                    println!("Removing BLS entry: {}", path.display());
+                    if !dry_run {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("failed to remove {}", path.display()))?;
+                    }
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    // 4. Remove composefs BLS entries from ESP.
+    for esp in &["/boot/efi", "/efi"] {
+        let esp_entries = Path::new(esp).join("loader/entries");
+        if esp_entries.exists() {
+            if let Ok(rd) = std::fs::read_dir(&esp_entries) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("bootc_") || name.starts_with("ostree-fallback-") {
+                        let path = entry.path();
+                        println!("Removing ESP BLS entry: {}", path.display());
+                        if !dry_run {
+                            std::fs::remove_file(&path)
+                                .with_context(|| format!("failed to remove {}", path.display()))?;
+                        }
+                        removed += 1;
+                    }
+                }
+            }
+            // Remove loader.conf if we wrote one.
+            let loader_conf = Path::new(esp).join("loader/loader.conf");
+            if loader_conf.exists() {
+                println!("Removing ESP loader.conf: {}", loader_conf.display());
+                if !dry_run {
+                    std::fs::remove_file(&loader_conf)?;
+                    removed += 1;
+                }
+            }
+        }
+        // Remove systemd-boot from ESP.
+        let sd_dir = Path::new(esp).join("EFI/systemd");
+        if sd_dir.exists() {
+            println!("Removing systemd-boot from ESP: {}", sd_dir.display());
+            if !dry_run {
+                std::fs::remove_dir_all(&sd_dir)?;
+                removed += 1;
+            }
+        }
+        let esp_linux = Path::new(esp).join("EFI/Linux");
+        if esp_linux.exists() {
+            if let Ok(rd) = std::fs::read_dir(&esp_linux) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("bootc_composefs-") {
+                        let path = entry.path();
+                        println!("Removing ESP EFI/Linux entry: {}", path.display());
+                        if !dry_run {
+                            std::fs::remove_dir_all(&path)
+                                .with_context(|| format!("failed to remove {}", path.display()))?;
+                        }
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Remove composefs loopback image (only with --full).
+    if full {
+        let loopback = Path::new("/sysroot/composefs-loopback.ext4");
+        if loopback.exists() {
+            println!("Removing composefs loopback image: {}", loopback.display());
+            if !dry_run {
+                std::fs::remove_file(loopback)?;
+                removed += 1;
+            }
+        }
+
+        // 6. Remove composefs object store (only with --full).
+        let composefs_dir = Path::new("/sysroot/composefs");
+        if composefs_dir.exists() {
+            let has_objects = composefs_dir.join("objects").exists();
+            let has_images = composefs_dir.join("images").exists();
+            if has_objects || has_images {
+                println!(
+                    "Removing composefs object store: {}",
+                    composefs_dir.display()
+                );
+                if !dry_run {
+                    for sub in &["objects", "images", "streams", "tmp"] {
+                        let p = composefs_dir.join(sub);
+                        if p.exists() {
+                            std::fs::remove_dir_all(&p)
+                                .with_context(|| format!("failed to remove {}", p.display()))?;
+                        }
+                    }
+                    removed += 1;
+                }
+            } else {
+                println!("Composefs directory exists but is empty (no objects/images).");
+                skipped += 1;
+            }
+        }
+    } else {
+        println!("Composefs object store and loopback preserved (re-run --full to clean).");
+    }
+
+    // 7. Optionally warn about NVRAM entries (can't clean those from userspace easily).
+    println!();
+    if dry_run {
+        println!("Would remove {} artifact(s).", removed);
+        println!("Re-run without --dry-run to apply.");
+    } else {
+        println!("Removed {} composefs artifact(s).", removed);
+        if skipped > 0 {
+            println!("{} path(s) skipped (empty or already clean).", skipped);
+        }
+        println!("The system is now in its pre-migration OSTree state.");
+        println!("Run 'bootc-migrate-composefs --target-image <image>' to try again.");
     }
     Ok(())
 }

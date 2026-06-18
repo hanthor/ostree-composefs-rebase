@@ -6,21 +6,21 @@ default:
 
 # === Build & Test ===
 
-# Build in dev profile
+# Build (set PROFILE_FLAG=--release for CI)
 build:
-    cargo build
+    cargo build {{env_var_or_default('PROFILE_FLAG', '')}}
 
-# Build in release profile
+# Build in release profile (convenience alias)
 build-release:
     cargo build --release
 
-# Run all unit tests
+# Run all unit tests (set PROFILE_FLAG=--release for CI)
 test:
-    cargo test
+    cargo test {{env_var_or_default('PROFILE_FLAG', '')}}
 
 # Run tests with output
 test-verbose:
-    cargo test -- --nocapture
+    cargo test {{env_var_or_default('PROFILE_FLAG', '')}} -- --nocapture
 
 # Run a single test (usage: just test-one test_name)
 test-one test_name:
@@ -32,23 +32,24 @@ check:
 
 # === E2E Tests ===
 
-# Run full E2E migration test
-# Defaults to Bluefin stable → Dakota stable (btrfs).
-e2e: build
+# Run full E2E migration test.
+# All parameters are env-var driven; set PROFILE_FLAG=--release for CI.
+# Defaults: Bluefin stable → Dakota stable (btrfs, 20G disk).
+e2e: build test
     sudo -E env PATH="{{env_var_or_default('PATH', '/usr/bin:/usr/sbin:/usr/local/bin')}}" \
       BASE_IMAGE="{{env_var_or_default('BASE_IMAGE', 'ghcr.io/projectbluefin/bluefin:stable')}}" \
       TARGET_IMAGE="{{env_var_or_default('TARGET_IMAGE', 'ghcr.io/projectbluefin/dakota:stable')}}" \
       DISK_SIZE="{{env_var_or_default('DISK_SIZE', '20G')}}" \
+      FILESYSTEM="{{env_var_or_default('FILESYSTEM', 'btrfs')}}" \
       ./tests/run-e2e.sh 2>&1 | tee e2e-run.log
 
-# Run E2E with Bluefin LTS → Dakota (xfs filesystem).
-# Uses --skip-import so Phase 1 reflink doesn't touch xfs.
-e2e-lts: build
+# Bluefin LTS → Dakota (xfs + loopback workaround).
+e2e-lts: build test
     sudo -E env PATH="{{env_var_or_default('PATH', '/usr/bin:/usr/sbin:/usr/local/bin')}}" \
       BASE_IMAGE="ghcr.io/projectbluefin/bluefin:lts" \
       TARGET_IMAGE="ghcr.io/projectbluefin/dakota:stable" \
       DISK_SIZE="20G" \
-      FILESYSTEM="ext4" \
+      FILESYSTEM="xfs" \
       ./tests/run-e2e.sh 2>&1 | tee e2e-lts.log
 
 # Run E2E with composefs boot log_level=debug
@@ -64,6 +65,65 @@ e2e-debug: build
       echo "--- all FAILED ---"; \
       grep -E 'FAILED|DEPEND' e2e-run.log | tail -30; \
       exit $$rc
+
+# === Linting ===
+
+# Run all linters (shellcheck, rustfmt, clippy)
+lint: lint-shell lint-rust
+
+# Lint shell scripts with shellcheck (warnings + errors only, skip info/style)
+lint-shell:
+    @echo "=== shellcheck ==="
+    shellcheck --severity=warning tests/run-e2e.sh
+
+# Lint Rust code (format + clippy)
+lint-rust:
+    @echo "=== cargo fmt --check ==="
+    cargo fmt --check
+    @echo "=== cargo clippy ==="
+    cargo clippy -- -D warnings
+
+# === Interactive E2E Steps ===
+# Run individual phases of the E2E test for debugging and iteration.
+
+# Show current E2E state (disk, QEMU, SSH, checkpoint)
+e2e-status:
+    @echo "=== E2E State ==="
+    @echo -n "disk.raw: "; [ -f disk.raw ] && echo "present ($(stat -c%s disk.raw) bytes)" || echo "missing"
+    @echo -n "pre-migration ckpt: "; [ -f disk.raw.pre-migration ] && echo present || echo missing
+    @echo -n "post-migration ckpt: "; [ -f disk.raw.post-migration ] && echo present || echo missing
+    @echo -n "QEMU: "; pgrep -f 'qemu-system.*disk.raw' > /dev/null && echo running || echo stopped
+    @echo -n "SSH (port 2222): "; timeout 3 bash -c 'echo > /dev/tcp/localhost/2222' 2>/dev/null && echo open || echo closed
+
+# Open interactive SSH to the E2E VM
+e2e-ssh:
+    ssh -i test_key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost
+
+# Tail the QEMU serial console log (filtered high-signal lines)
+e2e-tail:
+    @tail -F -q -n 0 qemu.log 2>/dev/null \
+      | sed -u 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+      | grep --line-buffered -E '\[FAILED\]|Failed to start|panic|Out of memory|kernel BUG|Kernel panic|sshd|login:|Welcome to|GRUB|Booting|systemd-boot|composefs|=== Phase|=== MIGRATION|bootc-migrate|Linux Boot Manager|dbus|messagebus|polkit|machine.id|emergency' || true
+
+# Host-side .raw disk scan only (no migration, no boot).
+# Requires: disk.raw (post-migration).
+e2e-scan:
+    @[ -f disk.raw ] || { echo "ERROR: disk.raw not found"; exit 1; }
+    sudo -E env PATH="{{env_var_or_default('PATH', '/usr/bin:/usr/sbin:/usr/local/bin')}}" \
+      FILESYSTEM="{{env_var_or_default('FILESYSTEM', 'xfs')}}" \
+      E2E_SCAN_ONLY=true \
+      ./tests/run-e2e.sh 2>&1 | tee e2e-scan.log
+
+# Reboot-test: launch QEMU from checkpoint, wait for composefs boot, validate.
+# Requires: disk.raw (post-migration) or disk.raw.post-migration checkpoint.
+e2e-reboot-test:
+    @[ -f disk.raw ] || [ -f disk.raw.post-migration ] || { echo "ERROR: no disk.raw or post-migration checkpoint"; exit 1; }
+    @[ -f disk.raw ] || cp disk.raw.post-migration disk.raw
+    sudo -E env PATH="{{env_var_or_default('PATH', '/usr/bin:/usr/sbin:/usr/local/bin')}}" \
+      BASE_IMAGE="{{env_var_or_default('BASE_IMAGE', 'ghcr.io/projectbluefin/bluefin:lts')}}" \
+      TARGET_IMAGE="{{env_var_or_default('TARGET_IMAGE', 'ghcr.io/projectbluefin/dakota:stable')}}" \
+      FILESYSTEM="{{env_var_or_default('FILESYSTEM', 'xfs')}}" \
+      ./tests/run-e2e.sh 2>&1 | tee e2e-boot-test.log
 
 # === Diagnostics ===
 
