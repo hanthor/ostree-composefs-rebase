@@ -7,6 +7,9 @@ set -euo pipefail
 # Unique LUKS mapper name per run to avoid stale dm device conflicts
 UUID_SUFFIX=$(date +%s)_$$  # timestamp + PID should be unique enough
 LUKS_MAPPER="e2e-root_${UUID_SUFFIX}"
+# Passphrase for the LUKS root in the xfs+crypt scenario; injected over the
+# serial console at the boot unlock prompt.
+LUKS_PASSPHRASE="testpassphrase"
 
 # Configurable parameters
 BASE_IMAGE="${BASE_IMAGE:-ghcr.io/projectbluefin/bluefin:stable}"
@@ -14,6 +17,9 @@ TARGET_IMAGE="${TARGET_IMAGE:-ghcr.io/projectbluefin/dakota:stable}"
 DISK_SIZE="${DISK_SIZE:-20G}"
 SSH_PORT="${SSH_PORT:-2222}"
 FILESYSTEM="${FILESYSTEM:-btrfs}"
+# Test variant: "migrate" (default — migrate, commit, rollback round-trip) or
+# "undo" (migrate, then verify `undo` cleans up and falls back to OSTree).
+E2E_TEST_MODE="${E2E_TEST_MODE:-migrate}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -282,6 +288,12 @@ cleanup() {
         kill "$SWTPM_PID" 2>/dev/null || true
         rm -rf /tmp/swtpm-tpmstate /tmp/swtpm-sock 2>/dev/null || true
     fi
+    # Clean up the LUKS passphrase injector + its FIFO.
+    if [ -n "${PW_INJECTOR_PID:-}" ]; then
+        kill "$PW_INJECTOR_PID" 2>/dev/null || true
+    fi
+    exec 9>&- 2>/dev/null || true
+    rm -f /tmp/e2e-qemu-stdin 2>/dev/null || true
     rm -f ./test_key ./test_key.pub
 }
 trap cleanup EXIT
@@ -296,65 +308,110 @@ LOOP_DEV=$(sudo losetup --show -f -P disk.raw)
 echo "Mounted loopback device: $LOOP_DEV"
 
 if [[ "$FILESYSTEM" == xfs+crypt ]]; then
-    echo "LUKS encryption enabled — installing plain disk first, then encrypting..."
-    # Use bootc install to-disk for proper ESP + bootloader setup.
+    # Install the GRUB-based source (Bluefin) with a LUKS-encrypted root, then
+    # let the migration convert it to systemd-boot + composefs. We drive LUKS
+    # ourselves and use `bootc install to-filesystem` (fisherman's process)
+    # rather than `--block-setup tpm2-luks`, because the latter seals the key to
+    # whatever TPM exists during the container install — not the VM's vTPM.
+    #
+    # Layout mirrors fisherman's DiskLayoutGrub: ESP + a separate *unencrypted*
+    # ext4 /boot (GRUB reads kernel/initrd here without parsing the LUKS/xfs
+    # root) + LUKS2 root. Unlock uses a keyfile on /boot for a deterministic,
+    # non-interactive boot (production enrolls TPM2/PCR7 instead — see
+    # docs/luks-testing.md).
+    echo "LUKS: partitioning (BIOS-boot + ESP + ext4 /boot + LUKS root)..."
+    # GPT layout matching what `bootc install to-disk --generic-image` creates:
+    # a 1 MiB BIOS boot partition (type 21686148-... = bios_grub) so grub2-install
+    # can embed its i386-pc core (otherwise it fails with "will not proceed with
+    # blocklists"), an ESP, a separate ext4 /boot for GRUB, then the LUKS root.
+    sudo sfdisk "$LOOP_DEV" <<'SFDISK'
+label: gpt
+size=1MiB,   type=21686148-6449-6E6F-744E-656564454649, name="BIOS-BOOT"
+size=512MiB, type=uefi, name="EFI-SYSTEM"
+size=1GiB,   type=linux, name="boot"
+type=linux, name="root"
+SFDISK
+    sudo partprobe "$LOOP_DEV" 2>/dev/null || true
+    sudo udevadm settle 2>/dev/null || true
+    ESP_PART="${LOOP_DEV}p2"
+    BOOT_PART="${LOOP_DEV}p3"
+    ROOT_PART="${LOOP_DEV}p4"
+
+    echo "LUKS: formatting root as LUKS2 with a passphrase..."
+    # el10's systemd-cryptsetup ignores dracut's rd.luks.key=path:dev syntax, so
+    # a keyfile on /boot doesn't auto-unlock. Instead use a known passphrase and
+    # inject it over the serial console at the boot prompt (see the QEMU launch).
+    printf '%s' "$LUKS_PASSPHRASE" | sudo cryptsetup luksFormat --batch-mode \
+        --type luks2 --key-file - "$ROOT_PART"
+    printf '%s' "$LUKS_PASSPHRASE" | sudo cryptsetup luksOpen \
+        --key-file - "$ROOT_PART" "$LUKS_MAPPER"
+    LUKS_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
+
+    echo "LUKS: making filesystems and mounting target..."
+    # The host may lack a usable system mkfs.xfs (e.g. only a HOME-relative user
+    # build that breaks under sudo). The install image ships real
+    # xfsprogs/e2fsprogs/dosfstools, so format the partitions inside it;
+    # --privileged + /dev exposes the loop partitions and the opened LUKS mapper.
+    sudo podman run --privileged --rm -v /dev:/dev "$INSTALL_IMAGE" bash -c "
+        set -e
+        mkfs.xfs -f /dev/mapper/$LUKS_MAPPER
+        mkfs.ext4 -F $BOOT_PART
+        mkfs.vfat -F32 $ESP_PART"
+    # Use /var/tmp (not /tmp, which is tmpfs on many hosts) as the mount point.
+    INSTALL_ROOT=/var/tmp/mnt-e2e-install
+    sudo mkdir -p "$INSTALL_ROOT"
+    sudo mount "/dev/mapper/$LUKS_MAPPER" "$INSTALL_ROOT"
+    sudo mkdir -p "$INSTALL_ROOT/boot"
+    sudo mount "$BOOT_PART" "$INSTALL_ROOT/boot"
+    sudo mkdir -p "$INSTALL_ROOT/boot/efi"
+    sudo mount "$ESP_PART" "$INSTALL_ROOT/boot/efi"
+    df -h "$INSTALL_ROOT" "$INSTALL_ROOT/boot" "$INSTALL_ROOT/boot/efi"
+
+    echo "LUKS: installing source image into the opened target via to-filesystem..."
+    # Mirrors fisherman's container invocation: bind-propagation=rslave makes the
+    # nested /boot and /boot/efi mounts visible inside the container (without it
+    # bootc writes to the wrong filesystem and trips ostree min-free-space);
+    # label=disable lets bootc write security.selinux xattrs to the target.
+    # Bind a real, disk-backed /var/tmp: ostree/containers-storage writes
+    # multi-GB intermediate import blobs there, and the container's default
+    # /var/tmp (overlay/tmpfs) is too small — it trips ostree's
+    # min-free-space-percent guard (dakota-iso's LUKS ENOSPC lesson).
     sudo podman run --privileged --pid=host --rm \
+        --security-opt label=disable \
         -v /dev:/dev \
+        -v /sys:/sys \
         -v /var/tmp:/var/tmp \
-        -v /tmp:/tmp \
         -v "$WORKSPACE_DIR":/workspace \
+        --mount "type=bind,src=$INSTALL_ROOT,dst=/target,bind-propagation=rslave" \
         "$INSTALL_IMAGE" \
-        bootc install to-disk \
+        bootc install to-filesystem \
         --generic-image \
-        --filesystem xfs \
+        --skip-fetch-check \
         --root-ssh-authorized-keys /workspace/test_key.pub \
-        "$LOOP_DEV"
+        /target
 
-    # Find root partition (XFS) and ESP
-    ROOT_PART=""; ESP_PART=""
-    for p in "${LOOP_DEV}"p*; do
-        fstype=$(sudo blkid -o value -s TYPE "$p" 2>/dev/null || true)
-        if [ "$fstype" = "vfat" ]; then ESP_PART="$p"
-        elif [ "$fstype" = "xfs" ]; then ROOT_PART="$p"; fi
+    echo "LUKS: writing LUKS kernel args to GRUB BLS entries..."
+    # bootc remounts the target filesystems read-only when finalizing the
+    # install; remount /boot rw so we can patch the BLS entries.
+    sudo mount -o remount,rw "$INSTALL_ROOT/boot" 2>/dev/null || true
+    sudo mount -o remount,rw "$INSTALL_ROOT" 2>/dev/null || true
+    # rd.luks.name=<UUID>=root maps the container to /dev/mapper/root, which
+    # systemd-gpt-auto-generator needs to locate the encrypted root (the bare
+    # mapper-name form silently fails — projectbluefin/dakota#270).
+    luks_args="rd.luks.name=$LUKS_UUID=root"
+    for bls in "$INSTALL_ROOT"/boot/loader/entries/*.conf; do
+        [ -f "$bls" ] || continue
+        if ! grep -q 'rd.luks' "$bls"; then
+            sudo sed -i "s|^\(options .*\)|\1 $luks_args|" "$bls"
+            echo "  patched $(basename "$bls")"
+        fi
     done
-    if [ -z "$ROOT_PART" ] || [ -z "$ESP_PART" ]; then
-        echo "ERROR: could not find root or ESP partition"; exit 1
-    fi
 
-    # Mount ESP, store LUKS keyfile
-    LUKS_KEYFILE="$WORKSPACE_DIR/luks.key"
-    dd if=/dev/urandom bs=64 count=1 of="$LUKS_KEYFILE" 2>/dev/null
-    sudo mkdir -p /tmp/mnt-e2e-luks-esp
-    sudo mount "$ESP_PART" /tmp/mnt-e2e-luks-esp
-    sudo mkdir -p /tmp/mnt-e2e-luks-esp/keys
-    sudo cp "$LUKS_KEYFILE" /tmp/mnt-e2e-luks-esp/keys/luks.key
-    sudo umount /tmp/mnt-e2e-luks-esp
-
-    # Convert root XFS to LUKS in-place
-    echo "[luks] encrypting root partition..."
-    sudo cryptsetup reencrypt \
-        --encrypt --type luks2 \
-        --key-file="$LUKS_KEYFILE" \
-        --reduce-device-size 32M \
-        --resilience=checksum --batch-mode \
-        "$ROOT_PART" 2>&1 || echo "[luks] WARN: reencrypt failed"
-
-    # Open LUKS, update BLS entries with rd.luks kernel args (on ESP)
-    if sudo cryptsetup open "$ROOT_PART" "$LUKS_MAPPER" --key-file="$LUKS_KEYFILE" 2>/dev/null; then
-        # Mount the ESP and patch BLS entries there (avoids XFS mount issues after reencrypt)
-        sudo mount "$ESP_PART" /tmp/mnt-e2e-luks-esp 2>/dev/null
-        for bls in /tmp/mnt-e2e-luks-esp/loader/entries/ostree-*.conf /tmp/mnt-e2e-luks-esp/boot/loader/entries/ostree-*.conf; do
-            [ -f "$bls" ] || continue
-            if ! grep -q 'rd.luks' "$bls"; then
-                sudo sed -i "s|^\(options .*\)|\1 rd.luks.key=/keys/luks.key rd.luks.name=$LUKS_MAPPER rd.luks.options=discard|" "$bls" 2>/dev/null || true
-                echo "[luks] added LUKS kernel args to $bls"
-            fi
-        done
-        sudo umount /tmp/mnt-e2e-luks-esp
-        sudo cryptsetup close "$LUKS_MAPPER"
-    fi
+    echo "LUKS: unmounting and closing..."
+    sudo umount "$INSTALL_ROOT/boot/efi" "$INSTALL_ROOT/boot" "$INSTALL_ROOT" 2>/dev/null || true
+    sudo cryptsetup luksClose "$LUKS_MAPPER" 2>/dev/null || true
     SKIP_SETUP=true
-    echo "LUKS disk setup complete"
+    echo "LUKS disk setup complete (bootc install to-filesystem + keyfile, GRUB source)"
 fi
 else
     echo "Installing base OSTree bootc system to disk image..."
@@ -400,18 +457,11 @@ for i in $(seq 1 10); do
     sudo udevadm settle 2>/dev/null || true
     for p in "${LOOP_DEV}"p*; do
         local_fstype=$(sudo blkid -o value -s TYPE "$p" 2>/dev/null || true)
-        if [ "$FILESYSTEM" = "xfs+crypt" ]; then
-            # LUKS: detect crypto_LUKS type, then open it
-            if [ "$local_fstype" = "crypto_LUKS" ]; then
-                ROOT_PART="$p"
-                LUKS_KEYFILE="$WORKSPACE_DIR/luks.key"
-                sudo cryptsetup open "$ROOT_PART" "$LUKS_MAPPER" --key-file="$LUKS_KEYFILE" 2>/dev/null || true
-                # Now the mapper device is available
-                ROOT_MAPPER="/dev/mapper/"$LUKS_MAPPER""
-                break 2
-            fi
-        elif [ "$local_fstype" = "$FILESYSTEM" ]; then
-            ROOT_PART="$p"; break 2
+        # This block only runs for non-LUKS filesystems (the xfs+crypt case
+        # returns early above), so match the plain root filesystem directly.
+        if [ "$local_fstype" = "$FILESYSTEM" ]; then
+            ROOT_PART="$p"
+            break 2
         fi
     done
     sleep 1
@@ -422,11 +472,7 @@ if [ -z "$ROOT_PART" ]; then
 fi
 MNT_DIR="/tmp/mnt-e2e-disk"
 sudo mkdir -p "$MNT_DIR"
-if [ "$FILESYSTEM" = "xfs+crypt" ] && [ -b "/dev/mapper/"$LUKS_MAPPER"" ]; then
-    sudo mount "/dev/mapper/"$LUKS_MAPPER"" "$MNT_DIR"
-else
-    sudo mount "$ROOT_PART" "$MNT_DIR"
-fi
+sudo mount "$ROOT_PART" "$MNT_DIR"
 
 # Wait a second for mount to settle
 sleep 1
@@ -591,6 +637,55 @@ if [ "$SKIP_SETUP" = false ] || [ ! -f "$OVMF_VARS" ]; then
     truncate -s "$CODE_SIZE" "$OVMF_VARS"
 fi
 
+# For tpm2-luks the encrypted root's unlock key is sealed to a TPM2 device, so
+# the VM needs an emulated TPM (swtpm) to enroll on first boot and unlock on
+# every boot. Launch one and expose it via SWTPM_QEMU_ARGS (consumed in the
+# QEMU command below) and SWTPM_PID (torn down in cleanup). Without this the
+# boot hangs at the LUKS prompt and the test times out.
+SWTPM_QEMU_ARGS=""
+if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+    if command -v swtpm >/dev/null 2>&1; then
+        SWTPM_STATE_DIR=/tmp/swtpm-tpmstate
+        SWTPM_SOCK=/tmp/swtpm-sock
+        rm -rf "$SWTPM_STATE_DIR"
+        mkdir -p "$SWTPM_STATE_DIR"
+        swtpm socket --tpm2 \
+            --tpmstate dir="$SWTPM_STATE_DIR" \
+            --ctrl type=unixio,path="$SWTPM_SOCK" \
+            --daemon --pid file=/tmp/swtpm.pid
+        SWTPM_PID=$(cat /tmp/swtpm.pid 2>/dev/null || true)
+        SWTPM_QEMU_ARGS="-chardev socket,id=chrtpm,path=$SWTPM_SOCK -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0"
+        echo "[luks] started emulated TPM2 (swtpm pid ${SWTPM_PID:-unknown}) for VM boot"
+    else
+        echo "[luks] WARNING: swtpm not found — tpm2-luks root cannot unlock; VM boot will hang" >&2
+    fi
+fi
+
+# For the encrypted scenario, answer the initramfs LUKS passphrase prompt over
+# the serial console. `-nographic` wires the guest serial to QEMU's stdin, so we
+# feed it from a FIFO that a background watcher writes to when the prompt appears.
+QEMU_STDIN=/dev/null
+if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+    PW_FIFO=/tmp/e2e-qemu-stdin
+    rm -f "$PW_FIFO"
+    mkfifo "$PW_FIFO"
+    exec 9<>"$PW_FIFO"   # hold the FIFO open so QEMU's reader never sees EOF
+    QEMU_STDIN="$PW_FIFO"
+    (
+        # Answer the LUKS prompt on EVERY boot — the initial boot and the
+        # post-migration reboot both prompt — so follow the serial log and type
+        # the passphrase whenever the prompt appears (systemd re-prompts on a
+        # missed/failed attempt, which produces a new line and re-triggers us).
+        tail -F -n +1 qemu.log 2>/dev/null | while IFS= read -r line; do
+            if printf '%s' "$line" | grep -qia 'enter passphrase for disk root'; then
+                printf '%s\n' "$LUKS_PASSPHRASE" >&9
+                echo "[luks] injected passphrase over serial console"
+            fi
+        done
+    ) &
+    PW_INJECTOR_PID=$!
+fi
+
 # Run QEMU in the background
 # q35 + a writable VARS pflash is required for OVMF NV-variable persistence.
 # On the default `pc` machine OVMF treats variable updates as volatile and
@@ -609,7 +704,7 @@ qemu-system-x86_64 \
     -drive file=disk.raw,format=raw,if=virtio \
     -netdev user,id=n1,hostfwd=tcp::"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=n1 \
-    ${SWTPM_QEMU_ARGS:-} > qemu.log 2>&1 &
+    ${SWTPM_QEMU_ARGS:-} < "$QEMU_STDIN" > qemu.log 2>&1 &
 QEMU_PID=$!
 
 # 7. Wait for SSH to be available
@@ -660,7 +755,7 @@ TARGET_REPO_TAG=$(basename "$TARGET_IMAGE")
 VM_TARGET_IMAGE="10.0.2.2:5000/${TARGET_REPO_TAG}"
 
 step "=== Copying migration utility to VM ==="
-scp $SCP_OPTS target/debug/ostree-composefs-rebase root@localhost:/var/tmp/bootc-migrate-composefs
+scp $SCP_OPTS target/debug/bootc-migrate-composefs root@localhost:/var/tmp/bootc-migrate-composefs
 
 step "=== Injecting /etc fixtures (live, copied by migration) ==="
 ssh $SSH_OPTS root@localhost bash <<'ETCFIX'
@@ -1074,6 +1169,67 @@ if [ "$FLAT_SYS" != "flatpak-system-stub-com.example.SystemApp" ]; then
 fi
 echo "OK: Flatpak user + system installations preserved."
 
+# --- undo (migration rollback cleanup) test ---
+# Selected with E2E_TEST_MODE=undo. We are booted into composefs after the
+# migration; verify `undo` removes the composefs boot path + staged deployment,
+# preserves OSTree + user state, and the system falls back to OSTree on reboot.
+if [ "$E2E_TEST_MODE" = "undo" ]; then
+    step "=== Running undo (migration rollback cleanup) test ==="
+
+    UNDO_DRY=$(ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs undo --dry-run 2>&1" || true)
+    echo "$UNDO_DRY" | sed 's/^/  /'
+    if ! echo "$UNDO_DRY" | grep -qiE 'Removing|composefs'; then
+        echo "FAIL: undo --dry-run listed nothing to remove"; exit 1
+    fi
+    PRE_CFS=$(ssh $SSH_OPTS root@localhost "ls -d /boot/efi/EFI/Linux/bootc_composefs-* 2>/dev/null | wc -l")
+    if [ "$PRE_CFS" -lt 1 ]; then
+        echo "FAIL: no composefs ESP artifacts before undo (dry-run may have deleted them)"; exit 1
+    fi
+    echo "OK: undo --dry-run lists artifacts and changes nothing."
+
+    # Real undo (non-destructive default: keep the composefs object store).
+    UNDO_OUT=$(ssh $SSH_OPTS root@localhost "/var/tmp/bootc-migrate-composefs undo 2>&1" || {
+        echo "FAIL: undo exited non-zero"; exit 1; })
+    echo "$UNDO_OUT" | sed 's/^/  /'
+
+    POST_CFS=$(ssh $SSH_OPTS root@localhost "ls -d /boot/efi/EFI/Linux/bootc_composefs-* 2>/dev/null | wc -l")
+    [ "$POST_CFS" -eq 0 ] || { echo "FAIL: composefs ESP artifacts remain after undo ($POST_CFS)"; exit 1; }
+    SD_PRESENT=$(ssh $SSH_OPTS root@localhost "test -d /boot/efi/EFI/systemd && echo present || echo absent")
+    [ "$SD_PRESENT" = absent ] || { echo "FAIL: systemd-boot still on ESP after undo"; exit 1; }
+    echo "OK: undo removed composefs boot artifacts + systemd-boot from ESP."
+
+    # The non-full undo must preserve OSTree so fallback works and a retry is possible.
+    OSTREE_REPO=$(ssh $SSH_OPTS root@localhost "test -d /sysroot/ostree/repo && echo yes || echo no")
+    [ "$OSTREE_REPO" = yes ] || { echo "FAIL: plain undo removed /sysroot/ostree (should be preserved)"; exit 1; }
+    echo "OK: OSTree deployment preserved by undo."
+
+    # Reboot — must come back on OSTree (fallback), not composefs.
+    ssh $SSH_OPTS root@localhost "systemctl reboot" || true
+    sleep 5
+    UNDO_BOOT_OK=no
+    for _ in $(seq 1 60); do
+        if ssh $SSH_OPTS root@localhost true 2>/dev/null; then UNDO_BOOT_OK=yes; break; fi
+        sleep 3
+    done
+    if [ "$UNDO_BOOT_OK" != yes ]; then
+        echo "FAIL: VM did not boot after undo"; tail -100 qemu.log; exit 1
+    fi
+    UNDO_CMDLINE=$(ssh $SSH_OPTS root@localhost "cat /proc/cmdline")
+    if echo "$UNDO_CMDLINE" | grep -q 'composefs='; then
+        echo "FAIL: still booting composefs after undo (cmdline: $UNDO_CMDLINE)"; exit 1
+    fi
+    echo "$UNDO_CMDLINE" | grep -q 'ostree=' || {
+        echo "FAIL: post-undo boot is neither composefs nor ostree"; exit 1; }
+    echo "OK: system booted OSTree after undo (fallback restored)."
+
+    WP_UNDO=$(ssh $SSH_OPTS root@localhost "ls -l /var/home/realuser/Pictures/migration-wallpaper.png 2>/dev/null | awk '{print \$5}'")
+    [ -n "$WP_UNDO" ] && [ "$WP_UNDO" != 0 ] || { echo "FAIL: user data lost after undo ($WP_UNDO)"; exit 1; }
+    echo "OK: user data preserved through undo ($WP_UNDO bytes)."
+
+    step "=== E2E TEST PASSED SUCCESSFULY ==="
+    exit 0
+fi
+
 # --- OSTree rollback test (#22) ---
 # Verify the migration isn't one-way: reorder BootOrder to put Fedora\shim
 # first (which chains into GRUB → the OSTree BLS entry), confirm Bluefin's
@@ -1274,6 +1430,34 @@ if ! echo "$BOOTC_STATUS_POST" | grep -q '"composefs"'; then
     echo "FAIL: bootc status lost composefs backend after commit"; exit 1
 fi
 echo "OK: bootc status confirms composefs backend."
+
+# --- Target subscription + bootc update verification ---
+# After commit the system must be a normal composefs bootc system subscribed to
+# the target image:tag, and able to fetch updates from it.
+step "=== Verifying target subscription + bootc update ==="
+
+BOOTC_JSON=$(ssh $SSH_OPTS root@localhost "bootc status --json 2>/dev/null")
+BOOTED_IMG=$(echo "$BOOTC_JSON" | jq -r '.status.booted.image.image.image // empty')
+echo "Booted image reference: ${BOOTED_IMG:-<none>}"
+if [ -z "$BOOTED_IMG" ]; then
+    echo "FAIL: bootc status reports no booted image reference"; exit 1
+fi
+# Must be subscribed to the target repo:tag we migrated to (e.g. dakota:stable).
+if ! echo "$BOOTED_IMG" | grep -qF "$TARGET_REPO_TAG"; then
+    echo "FAIL: booted image '$BOOTED_IMG' is not subscribed to target '$TARGET_REPO_TAG'"; exit 1
+fi
+echo "OK: subscribed to target image ($BOOTED_IMG)."
+
+# bootc must be able to reach that registry and check for an update. Exit 0
+# means it queried the target successfully (the image is already current, so no
+# update is staged — we only assert reachability, not that one exists).
+if UPGRADE_OUT=$(ssh $SSH_OPTS root@localhost "bootc upgrade --check 2>&1"); then
+    echo "$UPGRADE_OUT" | sed 's/^/  /'
+    echo "OK: bootc upgrade --check reached the target registry."
+else
+    echo "$UPGRADE_OUT" | sed 's/^/  /'
+    echo "FAIL: bootc upgrade --check could not query target '$VM_TARGET_IMAGE'"; exit 1
+fi
 
 # --- Post-commit diff against fresh Dakota reference ---
 # Capture a file listing of the post-commit system and compare against
