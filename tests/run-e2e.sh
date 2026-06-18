@@ -377,25 +377,6 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     sudo cryptsetup close "$LUKS_MAPPER"
     echo "LUKS disk setup complete"
 fi
-    # Add rd.luks.key + rd.luks.name + rd.luks.options kernel args to BLS entries
-    for bls in /tmp/mnt-e2e-luks-root/boot/loader/entries/ostree-*.conf; do
-        [ -f "$bls" ] || continue
-        if ! grep -q 'rd.luks' "$bls"; then
-            sudo sed -i \
-                "s|^\(options .*\)|\1 rd.luks.key=/keys/luks.key rd.luks.name=$LUKS_MAPPER rd.luks.options=discard|" \
-                "$bls"
-            echo "[luks] added LUKS kernel args to $bls"
-        fi
-    done
-
-    # No initrd rebuild needed: Fedora's stock initrds include systemd-cryptsetup
-    # and the LUKS dracut module. The crypttab entry + keyfile are sufficient.
-
-    sudo umount /tmp/mnt-e2e-luks-root
-    sudo cryptsetup close "$LUKS_MAPPER"
-    # Don't detach loop device here — the common cleanup after the SKIP_SETUP
-    # block handles it. Double-detach would fail with set -e.
-    echo "LUKS disk setup complete"
 else
     echo "Installing base OSTree bootc system to disk image..."
     # Run bootc install to-disk using podman on the loop device
