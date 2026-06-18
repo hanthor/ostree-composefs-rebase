@@ -343,6 +343,10 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
 
     # bootc install to-filesystem creates an OSTree deployment under
     # /ostree/deploy/default/deploy/<hash>.0. Find the deploy root.
+    echo "[luks] install root contents:"
+    ls -la /tmp/mnt-e2e-luks-root/ 2>&1 || echo "[luks] (mount not accessible)"
+    echo "[luks] ostree deploy dir:"
+    ls -la /tmp/mnt-e2e-luks-root/ostree/deploy/ 2>&1 || echo "[luks] (no ostree/deploy)"
     DEPLOY_ROOT=$(find /tmp/mnt-e2e-luks-root/ostree/deploy -maxdepth 8 -type d -name '*.0' 2>/dev/null | while read d; do
         if [ -d "$d/etc" ] && [ -d "$d/usr" ]; then echo "$d"; break; fi
     done)
