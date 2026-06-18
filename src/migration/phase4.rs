@@ -336,6 +336,46 @@ pub(crate) fn perform_etc_merge(verity: &VerityDigest, target_image: &str, etc_d
         }
     }
 
+    // Write sysroot-composefs.mount to the deploy /etc so it survives
+    // switch-root from initrd to real root. Without this, the loopback
+    // device is detected by udev but never mounted — /sysroot/composefs
+    // remains an empty mount point and bootc can't find meta.json.
+    let loopback_path = Path::new("/sysroot/composefs-loopback.ext4");
+    if loopback_path.exists() {
+        let mount_unit = format!(
+            r#"[Unit]
+Description=ComposeFS Loopback Mount (persistent)
+After=sysroot.mount
+Before=initrd-root-fs.target bootc-root-setup.service
+DefaultDependencies=no
+
+[Mount]
+What=/sysroot/composefs-loopback.ext4
+Where=/sysroot/composefs
+Type=ext4
+Options=loop,ro
+
+[Install]
+WantedBy=initrd-root-fs.target
+"#
+        );
+        let unit_dir = etc_dir.join("systemd/system");
+        fs::create_dir_all(&unit_dir)?;
+        let unit_path = unit_dir.join("sysroot-composefs.mount");
+        if !unit_path.exists() {
+            fs::write(&unit_path, mount_unit.as_bytes())
+                .context("failed to write sysroot-composefs.mount")?;
+            // Enable via .wants symlink in initrd-root-fs.target
+            let wants_dir = etc_dir.join("systemd/system/initrd-root-fs.target.wants");
+            fs::create_dir_all(&wants_dir)?;
+            let wants_link = wants_dir.join("sysroot-composefs.mount");
+            if !wants_link.exists() {
+                std::os::unix::fs::symlink("../sysroot-composefs.mount", &wants_link)?;
+            }
+            println!("[phase4] wrote sysroot-composefs.mount to deploy /etc");
+        }
+    }
+
     Ok(())
 }
 
