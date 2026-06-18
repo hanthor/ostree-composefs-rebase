@@ -356,7 +356,7 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
 
     # crypttab + keyfile on the installed system
     # bootc install to-filesystem leaves the target read-only; remount rw first.
-    sudo mount -o remount,rw /dev/mapper/"$LUKS_MAPPER" 2>/dev/null || true
+    sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>/dev/null || true
     LUKS_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
     sudo mkdir -p "$DEPLOY_ROOT/etc" "$DEPLOY_ROOT/keys"
     echo "$LUKS_MAPPER UUID=$LUKS_UUID /keys/luks.key luks" | sudo tee "$DEPLOY_ROOT/etc/crypttab"
