@@ -5,7 +5,7 @@
 LOG="$1"
 POLL="${2:-30}"
 IDLE_LIMIT="${3:-300}"
-ERROR_WORDS="${4:-ERROR|FAIL:|FAILED|Timeout|timed out|could not|No such|Permission denied|not found|exit code|exited with}"
+ERROR_WORDS="${4:-error|ERROR|FAIL:|FAILED|Timeout|timed out|could not|No such|Permission denied|not found|exit code|exited with|blocked by}"
 WHITELIST="${5:-WARN:|Warning:|warn:|WARNING}"
 
 if [ -z "$LOG" ]; then
@@ -25,7 +25,10 @@ STARTED=false
 # Wait for log to appear (E2E may be building first)
 for i in $(seq 1 10); do
     if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 0 ]; then
-        STARTED=true; break
+        STARTED=true
+        # Store first good size
+        LAST_SIZE=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+        break
     fi
     sleep 3
 done
@@ -38,8 +41,11 @@ while true; do
     CURRENT_SIZE=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
 
     if [ "$CURRENT_SIZE" != "$LAST_SIZE" ]; then
-        # Print new lines since last check (strip null bytes from binary content)
-        if [ "$LAST_SIZE" -gt 0 ] 2>/dev/null; then
+        if [ "$CURRENT_SIZE" -lt "$LAST_SIZE" ]; then
+            # File was truncated (log recreated) — print everything
+            tr -d '\0' < "$LOG" 2>/dev/null
+        elif [ "$LAST_SIZE" -gt 0 ] 2>/dev/null; then
+            # Print only the new bytes
             tail -c +$((LAST_SIZE + 1)) "$LOG" 2>/dev/null | tr -d '\0'
         else
             tr -d '\0' < "$LOG" 2>/dev/null
