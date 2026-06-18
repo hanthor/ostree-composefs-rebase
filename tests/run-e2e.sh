@@ -341,11 +341,15 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
         --root-ssh-authorized-keys /workspace/test_key.pub \
         /target
 
-    # bootc install to-filesystem writes directly to the root of the target
-    # filesystem — no OSTree subdirectory structure like to-disk creates.
-    DEPLOY_ROOT="/tmp/mnt-e2e-luks-root"
-    if [ ! -d "$DEPLOY_ROOT/etc" ]; then
-        echo "ERROR: no /etc in deploy root $DEPLOY_ROOT"; exit 1
+    # bootc install to-filesystem creates an OSTree deployment under
+    # /ostree/deploy/default/deploy/<hash>.0. Find the deploy root.
+    DEPLOY_ROOT=$(find /tmp/mnt-e2e-luks-root/ostree/deploy -maxdepth 8 -type d -name '*.0' 2>/dev/null | while read d; do
+        if [ -d "$d/etc" ] && [ -d "$d/usr" ]; then echo "$d"; break; fi
+    done)
+    if [ -z "$DEPLOY_ROOT" ]; then
+        echo "ERROR: could not find OSTree deployment root in /tmp/mnt-e2e-luks-root" >&2
+        ls -la /tmp/mnt-e2e-luks-root/ 2>&1 || true
+        exit 1
     fi
     echo "[luks] deploy root: $DEPLOY_ROOT"
 
