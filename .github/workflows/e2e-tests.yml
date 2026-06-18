@@ -28,6 +28,10 @@ jobs:
             base: ghcr.io/projectbluefin/bluefin:lts
             target: ghcr.io/projectbluefin/dakota:stable
             filesystem: ext4
+          - name: bluefin LTS -> dakota (LUKS + systemd-boot + composefs)
+            base: ghcr.io/projectbluefin/bluefin:lts
+            target: ghcr.io/projectbluefin/dakota:stable
+            filesystem: xfs+crypt
           # fedora-bootc self-migration is the simpler sanity case; revisit once
           # the bluefin scenario is green end-to-end.
           # - name: fedora-bootc self-migration
@@ -60,7 +64,9 @@ jobs:
             podman \
             jq \
             iproute2 \
-            netcat-openbsd
+            netcat-openbsd \
+            cryptsetup \
+            gdisk
 
       # GitHub-hosted Linux runners expose /dev/kvm but the runner user isn't in
       # the kvm group by default. Make it world-accessible for this job so QEMU
