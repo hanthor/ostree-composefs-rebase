@@ -1131,6 +1131,8 @@ fn phase5_setup_bootloader(
         .unwrap_or_else(|_| os_release::OsRelease {
             id: "linux".into(),
             version_id: String::new(),
+            name: String::new(),
+            pretty_name: String::new(),
         });
 
     let options_str = get_kernel_options(verity.as_hex())?;
@@ -1204,7 +1206,7 @@ fn phase5_setup_bootloader(
                     title: bls_entry_title(&target_os, "composefs"),
                     version: kver.clone(),
                     linux: format!("/EFI/Linux/{}/vmlinuz", boot_dir_name),
-                    initrd: format!("/EFI/Linux/{}/initrd", boot_dir_name),
+                    initrds: vec![format!("/EFI/Linux/{}/initrd", boot_dir_name)],
                     options: options_str.clone(),
                     filename: bls_entry_filename(&target_os, verity.as_hex(), 1),
                     sort_key: format!("bootc-{}-0", target_os.id),
@@ -1304,7 +1306,7 @@ fn phase5_setup_bootloader(
             title: bls_entry_title(&target_os, "composefs"),
             version: kver.clone(),
             linux: format!("/{}/vmlinuz", boot_dir_name),
-            initrd: format!("/{}/initrd", boot_dir_name),
+            initrds: vec![format!("/{}/initrd", boot_dir_name)],
             options: options_str.clone(),
             filename: bls_entry_filename(&target_os, verity.as_hex(), 1),
             sort_key: format!("bootc-{}-0", target_os.id),
@@ -2047,7 +2049,7 @@ fn build_ostree_fallback_on_esp(esp_path: &Path) -> Result<bootloader::BlsEntry>
         title: "Bluefin (OSTree fallback)".into(),
         version: kver,
         linux: "/EFI/Linux/ostree-fallback/vmlinuz".into(),
-        initrd: "/EFI/Linux/ostree-fallback/initrd".into(),
+        initrds: vec!["/EFI/Linux/ostree-fallback/initrd".into()],
         options: options.join(" "),
         filename: "ostree-fallback-0.conf".into(),
         sort_key: "ostree-fallback-99".into(),
@@ -2086,7 +2088,7 @@ fn build_ostree_fallback_entry() -> Result<bootloader::BlsEntry> {
         title: "OSTree (fallback)".into(),
         version: kver,
         linux: "/ostree-fallback/vmlinuz".into(),
-        initrd: "/ostree-fallback/initrd".into(),
+        initrds: vec!["/ostree-fallback/initrd".into()],
         options: options.join(" "),
         filename: "ostree-fallback-0.conf".into(),
         sort_key: "ostree-fallback-99".into(),
