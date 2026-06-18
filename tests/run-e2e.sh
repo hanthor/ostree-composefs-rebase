@@ -359,6 +359,9 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     # No crypttab needed: systemd-cryptsetup uses rd.luks.key= kernel arg
     # to find the keyfile on the ESP during early boot.
 
+    # Remount rw so we can edit BLS entries (bootc leaves fs ro)
+    sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>/dev/null || true
+
     # Add rd.luks kernel args to BLS entries
     for bls in /tmp/mnt-e2e-luks-root/boot/loader/entries/ostree-*.conf; do
         [ -f "$bls" ] || continue
