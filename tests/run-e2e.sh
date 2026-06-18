@@ -296,10 +296,11 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     ROOT_PART="${LOOP_DEV}p2"
     ESP_PART="${LOOP_DEV}p1"
 
-    # Create LUKS keyfile and format
+    # Close stale mapper from previous run, create keyfile, format LUKS
+    sudo cryptsetup close e2e-root 2>/dev/null || true
     LUKS_KEYFILE="$WORKSPACE_DIR/luks.key"
     dd if=/dev/urandom bs=64 count=1 of="$LUKS_KEYFILE" 2>/dev/null
-    sudo cryptsetup luksFormat "$ROOT_PART" --key-file="$LUKS_KEYFILE" --batch-mode
+    sudo cryptsetup luksFormat "$ROOT_PART" --key-file="$LUKS_KEYFILE" --batch-mode 2>&1
     sudo cryptsetup open "$ROOT_PART" e2e-root --key-file="$LUKS_KEYFILE"
 
     # Create XFS filesystem inside LUKS.
