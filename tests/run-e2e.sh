@@ -200,8 +200,12 @@ INSTALL_IMAGE="$MODIFIED_IMAGE"
 echo "Using install image: $INSTALL_IMAGE"
 
 # 5. Create and initialize disk image (or restore checkpoint)
+# LUKS: checkpoint has plain partition layout, not LUKS — always full setup.
 CHECKPOINT="$WORKSPACE_DIR/disk.raw.pre-migration"
-if [ -f "$CHECKPOINT" ]; then
+if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+    echo "LUKS mode: skipping pre-migration checkpoint (needs fresh LUKS setup)"
+    SKIP_SETUP=false
+elif [ -f "$CHECKPOINT" ]; then
     step "=== Restoring pre-migration checkpoint ==="
     cp "$CHECKPOINT" disk.raw
     SKIP_SETUP=true
@@ -279,10 +283,12 @@ echo "Mounted loopback device: $LOOP_DEV"
 
 if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     echo "LUKS encryption enabled — setting up disk manually..."
-    # Partition: ESP (vfat, 512MB) + root (LUKS, rest)
-    sudo sgdisk -Z "$LOOP_DEV"
-    sudo sgdisk -n 1:0:+512M -t 1:ef00 -c 1:EFI-SYSTEM "$LOOP_DEV"
-    sudo sgdisk -n 2:0:0 -t 2:8300 -c 2:root "$LOOP_DEV"
+    # Partition: ESP (vfat, 512MB) + root (LUKS, rest) using parted.
+    sudo parted -s "$LOOP_DEV" mklabel gpt
+    sudo parted -s "$LOOP_DEV" mkpart primary fat32 1MiB 513MiB
+    sudo parted -s "$LOOP_DEV" set 1 esp on
+    sudo parted -s "$LOOP_DEV" name 1 EFI-SYSTEM
+    sudo parted -s "$LOOP_DEV" mkpart primary 513MiB 100%
     sudo partprobe "$LOOP_DEV"
     sudo udevadm settle
 
@@ -296,8 +302,32 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     sudo cryptsetup luksFormat "$ROOT_PART" --key-file="$LUKS_KEYFILE" --batch-mode
     sudo cryptsetup open "$ROOT_PART" e2e-root --key-file="$LUKS_KEYFILE"
 
-    # Create XFS filesystem inside LUKS
-    sudo mkfs.xfs -f /dev/mapper/e2e-root
+    # Create XFS filesystem inside LUKS. Use the install image container
+    # to run mkfs.xfs if the host doesn't have xfsprogs installed.
+    if command -v mkfs.xfs &>/dev/null; then
+        sudo mkfs.xfs -f /dev/mapper/e2e-root
+    elif podman image exists localhost/bluefin-installer:latest 2>/dev/null; then
+        echo "[luks] using mkfs.xfs from container localhost/bluefin-installer:latest"
+        sudo podman run --rm --privileged \
+            -v /dev:/dev \
+            localhost/bluefin-installer:latest \
+            mkfs.xfs -f /dev/mapper/e2e-root
+    else
+        # Fallback: search any available image for mkfs.xfs
+        MKFS_IMG=$(podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | while read img; do
+            podman run --rm --entrypoint bash "$img" -c 'command -v mkfs.xfs' 2>/dev/null && echo "$img" && break
+        done | head -1)
+        if [ -n "$MKFS_IMG" ]; then
+            echo "[luks] using mkfs.xfs from container $MKFS_IMG"
+            sudo podman run --rm --privileged \
+                -v /dev:/dev \
+                "$MKFS_IMG" \
+                mkfs.xfs -f /dev/mapper/e2e-root
+        else
+            echo "[luks] xfsprogs not available in any container, using ext4"
+            sudo mkfs.ext4 -F /dev/mapper/e2e-root
+        fi
+    fi
     sudo mkdir -p /tmp/mnt-e2e-luks-root
     sudo mount /dev/mapper/e2e-root /tmp/mnt-e2e-luks-root
 
