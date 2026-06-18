@@ -343,11 +343,11 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
 
     # Find the OSTree deployment root (where /etc lives)
     DEPLOY_ROOT=$(sudo podman run --rm -v /tmp/mnt-e2e-luks-root:/target \
-        "$INSTALL_IMAGE" ostree admin --sysroot=/target --print-current-dir 2>/dev/null || true)
+        "$INSTALL_IMAGE" ostree admin --sysroot=/target --print-current-dir 2>&1 || true) || echo "[luks] ostree admin failed (non-fatal)"
     if [ -z "$DEPLOY_ROOT" ]; then
-        # Find the deploy dir (a directory ending in .0 with etc/ and var/ subdirs)
-        DEPLOY_ROOT=$(find /tmp/mnt-e2e-luks-root/ostree/deploy -maxdepth 5 -type d -name '*.0' 2>/dev/null | while read d; do
-            if [ -d "$d/etc" ] && [ -d "$d/var" ]; then echo "$d"; break; fi
+        # Find the deploy dir: a directory under deploy/ with etc/ and var/ subdirs
+        DEPLOY_ROOT=$(find /tmp/mnt-e2e-luks-root/ostree/deploy -maxdepth 6 -type d 2>/dev/null | while read d; do
+            if [ -d "$d/etc" ] && [ -d "$d/var" ] && [ -d "$d/usr" ]; then echo "$d"; break; fi
         done)
     fi
     if [ -z "$DEPLOY_ROOT" ]; then echo "ERROR: no deploy root"; exit 1; fi
