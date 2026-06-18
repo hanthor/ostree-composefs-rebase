@@ -364,14 +364,30 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
         --root-ssh-authorized-keys /workspace/test_key.pub \
         /target
 
+    # bootc install to-filesystem creates an OSTree deployment. Find the
+    # actual deployment root (where /etc lives) using ostree admin.
+    DEPLOY_ROOT=$(sudo podman run --rm -v /tmp/mnt-e2e-luks-root:/target \
+        "$INSTALL_IMAGE" ostree admin --sysroot=/target --print-current-dir 2>/dev/null || true)
+    if [ -z "$DEPLOY_ROOT" ]; then
+        # Fallback: find it manually
+        DEPLOY_ROOT=$(find /tmp/mnt-e2e-luks-root/ostree/deploy -maxdepth 5 -name 'etc' -type d 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
+    fi
+    if [ -z "$DEPLOY_ROOT" ]; then
+        echo "ERROR: could not find OSTree deployment root" >&2
+        exit 1
+    fi
+    # DEPLOY_ROOT from ostree is relative to sysroot, prepend full path
+    DEPLOY_ROOT="/tmp/mnt-e2e-luks-root/${DEPLOY_ROOT#/}"
+    echo "[luks] deploy root: $DEPLOY_ROOT"
+
     # Add crypttab entry and keyfile path to the installed system
     ESCAPED_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
     echo "$LUKS_MAPPER UUID=$ESCAPED_UUID /keys/luks.key luks" | \
-        sudo tee /tmp/mnt-e2e-luks-root/etc/crypttab
+        sudo tee "$DEPLOY_ROOT/etc/crypttab"
 
     # Copy keyfile into initramfs-accessible location on root
-    sudo mkdir -p /tmp/mnt-e2e-luks-root/keys
-    sudo cp "$LUKS_KEYFILE" /tmp/mnt-e2e-luks-root/keys/luks.key
+    sudo mkdir -p "$DEPLOY_ROOT/keys"
+    sudo cp "$LUKS_KEYFILE" "$DEPLOY_ROOT/keys/luks.key"
 
     # Add rd.luks.key + rd.luks.name + rd.luks.options kernel args to BLS entries
     for bls in /tmp/mnt-e2e-luks-root/boot/loader/entries/ostree-*.conf; do
