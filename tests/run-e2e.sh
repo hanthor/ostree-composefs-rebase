@@ -362,11 +362,13 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     # Remount rw so we can edit BLS entries (bootc leaves fs ro)
     sudo mount -o remount,rw /tmp/mnt-e2e-luks-root 2>/dev/null || true
 
-    # Add rd.luks kernel args to BLS entries
+    # Add rd.luks kernel args to BLS entries. Use a temp file outside the
+    # read-only mount to avoid sed's in-place temp file issue.
     for bls in /tmp/mnt-e2e-luks-root/boot/loader/entries/ostree-*.conf; do
         [ -f "$bls" ] || continue
         if ! grep -q 'rd.luks' "$bls"; then
-            sudo sed -i "s|^\(options .*\)|\1 rd.luks.key=/keys/luks.key rd.luks.name=$LUKS_MAPPER rd.luks.options=discard|" "$bls"
+            sudo sed "s|^\(options .*\)|\1 rd.luks.key=/keys/luks.key rd.luks.name=$LUKS_MAPPER rd.luks.options=discard|" "$bls" | \
+                sudo tee "$bls" > /dev/null
             echo "[luks] added LUKS kernel args to $bls"
         fi
     done
