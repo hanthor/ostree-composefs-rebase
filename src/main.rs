@@ -636,6 +636,14 @@ fn run_commit(dry_run: bool) -> Result<()> {
         );
     }
 
+    // /boot may be read-only under composefs (e.g. separate ext4 /boot partition
+    // on LUKS where the initramfs mounts it ro). Remount rw before cleanup.
+    if !dry_run {
+        let _ = std::process::Command::new("mount")
+            .args(["-o", "remount,rw", "/boot"])
+            .status();
+    }
+
     // 2. Stale OSTree BLS entries under /boot/loader/entries. The ESP-side
     //    ostree-fallback was removed above; /boot/loader/entries/ostree-*.conf
     //    is the GRUB-side equivalent.
