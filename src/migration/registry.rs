@@ -390,6 +390,13 @@ pub(crate) fn extract_kernel_modules_via_registry(
     image_ref: &str,
     kver: &str,
 ) -> Result<(TempDir, PathBuf)> {
+    // Try podman cache first — Phase 2 already pulled the target image into
+    // local containers-storage inside the VM, so extracting from there costs
+    // only seconds instead of re-downloading 120 layers from ghcr.io.
+    if let Ok(cached) = try_extract_kmod_subtree_from_podman(image_ref, kver) {
+        return Ok(cached);
+    }
+
     let endpoint = RegistryEndpoint::resolve(image_ref)?;
     let manifest_json = endpoint.fetch_manifest(&endpoint.reference)?;
     let layers_manifest = endpoint.arch_layers_manifest(manifest_json)?;
@@ -453,6 +460,88 @@ pub(crate) fn extract_kernel_modules_via_registry(
         ));
     }
     Ok((scratch, mods))
+}
+
+/// Try extracting the kernel module subtree from the local podman cache.
+/// Returns `(tmpdir, usr/lib/modules/<kver> path)` on success.
+fn try_extract_kmod_subtree_from_podman(image_ref: &str, kver: &str) -> Result<(TempDir, PathBuf)> {
+    let has = Command::new("podman")
+        .args(["image", "exists", image_ref])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !has {
+        return Err(anyhow!("image not in local podman storage"));
+    }
+
+    let create = Command::new("podman")
+        .args(["create", "--name", "migrate-kmod-extract", image_ref])
+        .output()
+        .map_err(|e| anyhow!("podman create failed: {e}"))?;
+    if !create.status.success() {
+        return Err(anyhow!("podman create failed"));
+    }
+    let container_id = String::from_utf8_lossy(&create.stdout).trim().to_string();
+
+    let cleanup = |_e: &anyhow::Error| {
+        let _ = Command::new("podman")
+            .args(["rm", "-f", "migrate-kmod-extract"])
+            .status();
+    };
+
+    let tmp = TempDir::new_in("/var/tmp").map_err(|e| anyhow!("failed to create temp dir: {e}"))?;
+    let dst = tmp.path().join(kver);
+    fs::create_dir_all(&dst).map_err(|e| anyhow!("failed to create {dst:?}: {e}"))?;
+
+    println!(
+        "[extract] podman cp {}:/usr/lib/modules/{kver} -> ...",
+        image_ref
+    );
+    let cp = Command::new("podman")
+        .args([
+            "cp",
+            &format!("{container_id}:/usr/lib/modules/{kver}"),
+            dst.to_str().unwrap_or("/dev/null"),
+        ])
+        .status()
+        .map_err(|e| {
+            cleanup(&anyhow!("{e}"));
+            anyhow!("podman cp failed: {e}")
+        })?;
+
+    let _ = Command::new("podman")
+        .args(["rm", "-f", "migrate-kmod-extract"])
+        .status();
+
+    if !cp.success() {
+        return Err(anyhow!("podman cp exited {}", cp.code().unwrap_or(-1)));
+    }
+
+    // podman cp copies CONTENTS of source dir into dest, so files land at
+    // tmp/<kver>/kernel/... — that matches the expected kmoddir layout.
+    let mods = tmp.path().join(format!("usr/lib/modules/{kver}"));
+    // If podman laid files at the source dir name, rename to full path.
+    let flat = tmp.path().join(kver);
+    let kmod_path = if flat.join("modules.dep.bin").exists() || flat.join("kernel").exists() {
+        // podman cp preserved just the last component — create full path.
+        fs::create_dir_all(mods.parent().unwrap())?;
+        let _ = fs::rename(&flat, &mods);
+        mods
+    } else if !mods.exists() {
+        return Err(anyhow!(
+            "podman cp did not produce modules at {mods:?} or {flat:?}"
+        ));
+    } else {
+        mods
+    };
+
+    if !kmod_path.join("modules.dep.bin").exists() {
+        return Err(anyhow!(
+            "extracted modules from podman are missing modules.dep.bin"
+        ));
+    }
+    println!("[extract] kernel modules from local podman cache at {kmod_path:?}");
+    Ok((tmp, kmod_path))
 }
 
 /// Resolved registry endpoint: base URL (scheme + host), repository, reference, and
