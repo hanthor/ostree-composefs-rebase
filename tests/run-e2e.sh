@@ -706,43 +706,12 @@ if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
     exit 1
 fi
 
-# 8. Ensure the target image is in the local registry (the VM pulls from it).
-# Self-seeding so the test is self-contained locally and in CI: start the
-# registry if it's down, and mirror the target image into it if missing. The
-# VM reaches the host registry at 10.0.2.2:5000 (QEMU user-net gateway).
-step "=== Verifying target image ==="
-LOCAL_REG="127.0.0.1:5000"
-# Derive the repo:tag from TARGET_IMAGE so CI matrices that test other
-# base/target pairs don't have to patch the script — the local registry mirrors
-# it by the same path.
-TARGET_REPO_TAG=$(basename "$TARGET_IMAGE")   # e.g. dakota:stable
-TARGET_REPO=${TARGET_REPO_TAG%%:*}            # dakota
-TARGET_TAG=${TARGET_REPO_TAG##*:}             # stable
-VM_TARGET_IMAGE="10.0.2.2:5000/${TARGET_REPO_TAG}"
-
-if ! curl -sf "http://${LOCAL_REG}/v2/" >/dev/null 2>&1; then
-    step "Local registry not reachable — starting e2e-registry..."
-    if sudo podman ps -a --format '{{.Names}}' | grep -qx e2e-registry; then
-        sudo podman start e2e-registry
-    else
-        sudo podman run -d --name e2e-registry --network=host \
-            docker.io/library/registry:2
-    fi
-    for _ in $(seq 1 30); do
-        curl -sf "http://${LOCAL_REG}/v2/" >/dev/null 2>&1 && break
-        sleep 1
-    done
-    curl -sf "http://${LOCAL_REG}/v2/" >/dev/null 2>&1 \
-        || { echo "ERROR: local registry failed to start"; exit 1; }
-fi
-
-if ! curl -sf "http://${LOCAL_REG}/v2/${TARGET_REPO}/tags/list" 2>/dev/null \
-        | grep -q "\"${TARGET_TAG}\""; then
-    step "Mirroring ${TARGET_IMAGE} into ${LOCAL_REG}/${TARGET_REPO_TAG}..."
-    sudo podman image exists "$TARGET_IMAGE" || sudo podman pull "$TARGET_IMAGE"
-    sudo podman tag "$TARGET_IMAGE" "${LOCAL_REG}/${TARGET_REPO_TAG}"
-    sudo podman push --tls-verify=false "${LOCAL_REG}/${TARGET_REPO_TAG}"
-fi
+# 8. The migration pulls the target image directly from its upstream registry
+# (RegistryEndpoint streams layers and does the ghcr.io bearer-token dance — see
+# src/migration/registry.rs::probe_v2). No local registry mirror: mirroring both
+# ~9 GB images cost ~35 min in CI and timed the job out before the e2e ran.
+VM_TARGET_IMAGE="$TARGET_IMAGE"
+step "=== Target image: ${VM_TARGET_IMAGE} (pulled directly by the migration) ==="
 
 step "=== Copying migration utility to VM ==="
 scp $SCP_OPTS target/debug/bootc-migrate-composefs root@localhost:/var/tmp/bootc-migrate-composefs
@@ -750,9 +719,6 @@ scp $SCP_OPTS target/debug/bootc-migrate-composefs root@localhost:/var/tmp/bootc
 step "=== Injecting /etc fixtures (live, copied by migration) ==="
 ssh $SSH_OPTS root@localhost bash <<'ETCFIX'
 set -e
-# Allow insecure pulls from the host's local registry.
-mkdir -p /etc/containers/registries.conf.d
-printf '[[registry]]\nlocation = "10.0.2.2:5000"\ninsecure = true\n' > /etc/containers/registries.conf.d/50-local-registry.conf
 # Custom config file in /etc to verify /etc state is preserved through migration
 mkdir -p /etc/migration-test
 echo "etc-state-value" > /etc/migration-test/marker.conf
