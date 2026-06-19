@@ -258,6 +258,7 @@ fn prepare_composefs_loopback_include() -> Result<tempfile::TempDir> {
 
 fn rebuild_initrd_with_lvm_if_needed(
     kver: &str,
+    mount_path: &Path,
     target_image: &str,
     initrd_dst: &Path,
 ) -> Result<()> {
@@ -276,11 +277,19 @@ fn rebuild_initrd_with_lvm_if_needed(
     };
     println!("[phase5] Rebuilding composefs initrd with {label} support...");
 
-    // Source the target's kernel modules from the registry (real bytes); the
-    // Phase 5 composefs mount can degrade to raw EROFS where large files read as
-    // zeros. `_modules_tmp` holds the extracted tree alive until the rebuild ends.
-    let (_modules_tmp, modules_src) = extract_kernel_modules_via_registry(target_image, kver)
-        .context("failed to obtain target kernel modules for initrd rebuild")?;
+    // Source the target's kernel modules from the sealed composefs overlay mount
+    // (real bytes, no network), falling back to registry streaming if they're
+    // absent. `_modules_tmp` holds the writable copy alive until the rebuild ends
+    // (depmod must write modules.dep.bin, so the read-only mount can't be used
+    // directly).
+    let (_modules_tmp, modules_src) = match copy_kernel_modules_from_mount(mount_path, kver) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[phase5] kernel modules not available from mount ({e:#}); using registry");
+            extract_kernel_modules_via_registry(target_image, kver)
+                .context("failed to obtain target kernel modules for initrd rebuild")?
+        }
+    };
 
     // The target image ships no dracut binary — only its dracut *modules* — so we
     // run the *source* system's dracut, which carries the same 50ostree/51bootc
@@ -498,7 +507,7 @@ pub fn run_migration(
     let (_manifest_digest, config_digest) = phase2_pull_image(target_image, dry_run)?;
 
     // ---- Phase 3: Create and seal EROFS image ----
-    let verity = phase3_create_image(&config_digest, dry_run)?;
+    let (verity, sealed_config) = phase3_create_image(&config_digest, dry_run)?;
 
     // ---- Phase 4: Stage deployment state ----
     let _deploy_dir = phase4_stage_deploy(
@@ -506,11 +515,20 @@ pub fn run_migration(
         target_image,
         &_manifest_digest,
         &config_digest,
+        &sealed_config,
         dry_run,
     )?;
 
     // ---- Phase 5: Setup bootloader ----
-    phase5_setup_bootloader(report, &verity, target_image, dry_run, bootloader, force)?;
+    phase5_setup_bootloader(
+        report,
+        &verity,
+        target_image,
+        &sealed_config,
+        dry_run,
+        bootloader,
+        force,
+    )?;
 
     println!("\n=== MIGRATION COMPLETED ===");
     println!("Staged ComposeFS deployment: {}", verity.as_hex());
@@ -620,7 +638,14 @@ fn phase2_pull_image(target_image: &str, dry_run: bool) -> Result<(String, Strin
 
 // ---- Phase 3 ----
 
-fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDigest> {
+/// Returns `(rootfs_verity, sealed_config_digest)`. The rootfs verity is the
+/// composefs image object ID used in `.origin`/BLS for the boot-time root
+/// mount; the sealed config digest (`sha256:…`) is the *manifest stream*
+/// identifier that `bootc … cfs oci mount` requires (it prepends
+/// `oci-config-` and looks up `streams/oci-config-<digest>`). These are
+/// distinct: passing the rootfs verity to `mount` looks up a nonexistent
+/// `oci-config-<verity>` stream and forces the zero-filling raw-EROFS fallback.
+fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<(VerityDigest, String)> {
     println!("=== Phase 3: Creating ComposeFS EROFS Image ===");
 
     if dry_run {
@@ -628,8 +653,11 @@ fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDiges
             "[DRY RUN] Would create and seal composefs image for config: {}",
             config_digest
         );
-        return Ok(VerityDigest::from_hex(
-            "dryrun0000000000000000000000000000000000000000000000000000000000",
+        return Ok((
+            VerityDigest::from_hex(
+                "dryrun0000000000000000000000000000000000000000000000000000000000",
+            ),
+            config_digest.to_string(),
         ));
     }
 
@@ -645,17 +673,24 @@ fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDiges
         verity.as_hex()
     );
 
-    // The `bootc internals cfs seal` command creates the `oci-config-<verity>`
-    // stream in the composefs object store, which the initramfs needs for
-    // proper composefs user-space mounting (without it, bootc falls back to
-    // raw kernel EROFS mount which zero-fills files above the inline threshold,
-    // causing missing unit files like dbus.service and cascading boot failures).
+    // `bootc … cfs oci seal` clones the manifest with the embedded verity digest
+    // and prints the *sealed* manifest's `config <sha256:…>` line. That sealed
+    // config digest — NOT the rootfs verity above — is what `cfs oci mount`
+    // needs; without using it, mount fails and bootc falls back to a raw kernel
+    // EROFS mount which zero-fills files above the inline threshold (causing
+    // missing unit files like dbus.service and cascading boot failures).
     // Always seal — idempotency is handled inside bootc.
     println!("Sealing composefs image...");
-    crate::composefs::seal_image(config_digest).context("failed to seal composefs image")?;
-    println!("Image sealed successfully.");
+    let seal_out =
+        crate::composefs::seal_image(config_digest).context("failed to seal composefs image")?;
+    let sealed_config = seal_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("config "))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| anyhow!("seal output missing 'config <digest>' line; got:\n{seal_out}"))?;
+    println!("Image sealed successfully (sealed config: {sealed_config}).");
 
-    Ok(verity)
+    Ok((verity, sealed_config))
 }
 
 // ---- Phase 4 ----
@@ -704,6 +739,7 @@ fn phase4_stage_deploy(
     target_image: &str,
     manifest_digest: &str,
     config_digest: &str,
+    sealed_config: &str,
     dry_run: bool,
 ) -> Result<PathBuf> {
     println!("=== Phase 4: Staging Deployment State ===");
@@ -739,7 +775,7 @@ fn phase4_stage_deploy(
 
     // 3-way /etc merge
     println!("Performing 3-way /etc merge...");
-    if let Err(e) = perform_etc_merge(verity, target_image, &etc_dir) {
+    if let Err(e) = perform_etc_merge(target_image, sealed_config, &etc_dir) {
         eprintln!(
             "3-way /etc merge failed ({}), falling back to flat /etc copy.",
             e
@@ -921,62 +957,45 @@ fn resolve_device_uuid(device: &str) -> Option<String> {
 }
 
 /// Perform 3-way /etc merge: old OSTree default, current live /etc, new ComposeFS default.
-fn perform_etc_merge(verity: &VerityDigest, target_image: &str, etc_dir: &Path) -> Result<()> {
+fn perform_etc_merge(target_image: &str, sealed_config: &str, etc_dir: &Path) -> Result<()> {
     let temp_mount =
         TempDir::new_in("/var/tmp").context("failed to create temp mount directory")?;
     let mount_path = temp_mount.path().to_path_buf();
 
-    // Mount the new EROFS image — we still need it to validate the prune
-    // step's /usr/* symlink targets. EROFS mount lists directory contents
-    // correctly (it's the file *content* past the inline threshold that
-    // reads as zeros), so symlink-target existence checks work fine here.
-    mount_image(verity.as_hex(), &mount_path).context("failed to mount EROFS for etc merge")?;
+    // Mount the target rootfs via bootc's composefs overlay using the *sealed
+    // config digest* (not the rootfs verity): `cfs oci mount` looks up
+    // `streams/oci-config-<sealed-config>`, so the rootfs verity would miss and
+    // drop us to a raw EROFS mount that zero-fills file content above the inline
+    // threshold. With the sealed digest the overlay exposes real content, so we
+    // can read /etc straight off the mount (and validate prune symlink targets).
+    mount_image(sealed_config, &mount_path)
+        .context("failed to mount target composefs for etc merge")?;
     let _guard = MountGuard::new(&mount_path);
 
     let old_default_etc = find_ostree_etc_default()?;
     let current_etc = Path::new("/etc");
 
-    // Stream Dakota's real /etc bytes from the registry (oldest layer first,
-    // newer wins). Reading /etc from the local EROFS mount silently returns
-    // zero-filled content for any file past the per-inode inline threshold
-    // because the composefs object store is missing the `oci-config-<verity>`
-    // stream (Phase 2 pull does not produce it), so `bootc internals cfs oci
-    // mount` falls back to bare-EROFS mode. Past attempts to fix this in the
-    // overlay path were brittle; streaming a real `/etc` tree side-steps the
-    // whole thing and the merged result no longer depends on the mount.
+    // Use the target's /etc straight off the sealed overlay mount (real
+    // content). Previously this streamed ~120 layers from the registry because
+    // the mount was in bare-EROFS mode and zero-filled content; that path is
+    // kept only as a fallback for when /etc is somehow absent from the mount.
+    // (The temp dir is held to function scope so it outlives merge_etc_files.)
     let registry_etc_temp =
         TempDir::new_in("/var/tmp").context("failed to create temp dir for registry /etc")?;
     let registry_etc = registry_etc_temp.path().to_path_buf();
-    let new_default_etc = match extract_subtree_via_registry(target_image, "etc/", &registry_etc) {
-        Ok(())
-            if registry_etc
-                .read_dir()
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false) =>
-        {
-            println!("[phase4] streamed target /etc from registry for merge source");
-            registry_etc.clone()
-        }
-        Ok(()) => {
-            eprintln!(
-                "[phase4] warning: registry /etc extract produced no files, falling back to EROFS mount"
-            );
-            let p = mount_path.join("etc");
-            if !p.exists() {
-                anyhow::bail!("no /etc in new composefs image");
-            }
-            p
-        }
-        Err(e) => {
-            eprintln!(
-                "[phase4] warning: registry /etc extract failed ({e:#}), falling back to EROFS mount"
-            );
-            let p = mount_path.join("etc");
-            if !p.exists() {
-                anyhow::bail!("no /etc in new composefs image");
-            }
-            p
-        }
+    let mount_etc = mount_path.join("etc");
+    let new_default_etc = if mount_etc
+        .read_dir()
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+    {
+        println!("[phase4] using composefs-mounted /etc for merge source");
+        mount_etc
+    } else {
+        println!("[phase4] /etc absent from mount; streaming target /etc from registry...");
+        extract_subtree_via_registry(target_image, "etc/", &registry_etc)
+            .context("registry /etc extraction failed")?;
+        registry_etc
     };
 
     crate::mergetc::merge_etc_files(&old_default_etc, current_etc, &new_default_etc, etc_dir)
@@ -1277,6 +1296,7 @@ fn phase5_setup_bootloader(
     report: &PreflightReport,
     verity: &VerityDigest,
     target_image: &str,
+    sealed_config: &str,
     dry_run: bool,
     bootloader: &str,
     force: bool,
@@ -1339,7 +1359,10 @@ fn phase5_setup_bootloader(
         return Ok(());
     }
 
-    mount_image(verity.as_hex(), &mount_path)
+    // Mount via the sealed config digest (see perform_etc_merge): the rootfs
+    // verity would miss the oci-config stream and fall back to a raw EROFS mount
+    // that zero-fills kernel/initrd/systemd-bootx64.efi content.
+    mount_image(sealed_config, &mount_path)
         .context("failed to mount composefs image for boot artifacts")?;
     let _guard = MountGuard::new(&mount_path);
 
@@ -1419,16 +1442,19 @@ fn phase5_setup_bootloader(
                 } else {
                     esp_initrd = PathBuf::new();
                 }
-                extract_files_via_registry(target_image, &extract).context(
-                    "failed to extract kernel/initrd from target image via registry stream",
-                )?;
+                extract_files_preferring_mount(&mount_path, target_image, &extract)
+                    .context("failed to copy kernel/initrd from target image")?;
 
                 // Rebuild initrd with LVM support if the source system uses LVM.
                 // Must happen before patch_origin_boot_digest so the hash covers
                 // the LVM-enabled initrd bytes, not the original Dakota initrd.
                 if have_initrd
-                    && let Err(e) =
-                        rebuild_initrd_with_lvm_if_needed(&kver, target_image, &esp_initrd)
+                    && let Err(e) = rebuild_initrd_with_lvm_if_needed(
+                        &kver,
+                        &mount_path,
+                        target_image,
+                        &esp_initrd,
+                    )
                 {
                     eprintln!("[phase5] Warning: composefs initrd rebuild failed: {e:#}");
                 }
@@ -1537,12 +1563,12 @@ fn phase5_setup_bootloader(
             .iter()
             .map(|(s, d)| (s.as_path(), d.as_path()))
             .collect();
-        extract_files_via_registry(target_image, &extract_pairs).context(
-            "failed to extract kernel/initrd from target image via registry stream (GRUB2 path)",
-        )?;
+        extract_files_preferring_mount(&mount_path, target_image, &extract_pairs)
+            .context("failed to copy kernel/initrd from target image (GRUB2 path)")?;
 
         if have_grub_initrd
-            && let Err(e) = rebuild_initrd_with_lvm_if_needed(&kver, target_image, &grub_initrd)
+            && let Err(e) =
+                rebuild_initrd_with_lvm_if_needed(&kver, &mount_path, target_image, &grub_initrd)
         {
             eprintln!("[phase5] Warning: LVM initrd rebuild failed: {e:#}");
         }
@@ -1669,6 +1695,66 @@ fn phase5_setup_bootloader(
 /// btrfs (the EROFS image and composefs object store have already eaten most of /var).
 /// Instead we hit the registry HTTP API directly and stream one layer at a time,
 /// deleting it before moving on so peak disk use is bounded by the largest layer.
+/// Copy files out of a mounted composefs image, falling back to registry
+/// streaming only for sources missing from the mount. Each pair is
+/// `(path-in-image starting with "/", destination)`. Now that Phase 3 seals the
+/// image and Phases 4/5 mount it by its sealed config digest, the composefs
+/// overlay exposes real file content — so the kernel, initrd, systemd-bootx64.efi
+/// etc. can be copied straight off the mount, removing the runtime dependency on
+/// reaching the image's upstream registry (which an offline target or a CI VM
+/// with no egress cannot satisfy).
+fn extract_files_preferring_mount(
+    mount_path: &Path,
+    image_ref: &str,
+    files: &[(&Path, &Path)],
+) -> Result<()> {
+    let mut missing: Vec<(&Path, &Path)> = Vec::new();
+    for (src, dest) in files {
+        let rel = src.strip_prefix("/").unwrap_or(src);
+        let from = mount_path.join(rel);
+        if !from.exists() {
+            missing.push((*src, *dest));
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent dir for {}", dest.display()))?;
+        }
+        fs::copy(&from, dest)
+            .with_context(|| format!("copying {} -> {}", from.display(), dest.display()))?;
+    }
+    if !missing.is_empty() {
+        println!(
+            "[extract] {} file(s) absent from composefs mount; falling back to registry",
+            missing.len()
+        );
+        extract_files_via_registry(image_ref, &missing)?;
+    }
+    Ok(())
+}
+
+/// Copy the target kernel's module tree out of a mounted composefs image into a
+/// writable scratch dir (depmod must write `modules.dep.bin`, and the mount is
+/// read-only). Returns the same `(scratch, modules_dir)` shape as
+/// [`extract_kernel_modules_via_registry`] so callers are interchangeable.
+fn copy_kernel_modules_from_mount(mount_path: &Path, kver: &str) -> Result<(TempDir, PathBuf)> {
+    let src = mount_path.join("usr/lib/modules").join(kver);
+    if !src.join("kernel").is_dir() {
+        anyhow::bail!(
+            "kernel modules for {kver} not present in composefs mount at {}",
+            src.display()
+        );
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("bootc-migrate-kmods-")
+        .tempdir_in("/var/tmp")
+        .context("failed to create /var/tmp scratch dir for kernel modules")?;
+    let dst = scratch.path().join("usr/lib/modules").join(kver);
+    crate::xattr::copy_dir_all_with_xattrs(&src, &dst)
+        .with_context(|| format!("copying kernel modules from {}", src.display()))?;
+    Ok((scratch, dst))
+}
+
 fn extract_files_via_registry(image_ref: &str, files: &[(&Path, &Path)]) -> Result<()> {
     let endpoint = RegistryEndpoint::resolve(image_ref)?;
     let manifest_json = endpoint.fetch_manifest(&endpoint.reference)?;
@@ -2292,8 +2378,9 @@ fn install_systemd_boot_from_target(
     mount_path: &Path,
     target_image: &str,
 ) -> Result<()> {
-    // Probe via the EROFS mount only to confirm the file exists in the target image
-    // (file listing works fine on raw EROFS; it's the content reads that are corrupt).
+    // The sealed composefs overlay mount exposes real file content, so the
+    // systemd-boot binary is read straight off the mount (with a registry
+    // fallback for the unusual case where it's absent from the mount).
     let probe = mount_path.join("usr/lib/systemd/boot/efi/systemd-bootx64.efi");
     if !probe.exists() {
         return Err(anyhow!(
@@ -2308,14 +2395,15 @@ fn install_systemd_boot_from_target(
     fs::create_dir_all(&removable_dir)?;
 
     let sd_dst = sd_dir.join("systemd-bootx64.efi");
-    extract_files_via_registry(
+    extract_files_preferring_mount(
+        mount_path,
         target_image,
         &[(
             Path::new("/usr/lib/systemd/boot/efi/systemd-bootx64.efi"),
             &sd_dst,
         )],
     )
-    .context("failed to extract systemd-bootx64.efi from target image via registry stream")?;
+    .context("failed to install systemd-bootx64.efi from target image")?;
 
     // Mirror to removable-media path. Local copy of the freshly-extracted (real) bytes
     // is safe — no EROFS in the read path.

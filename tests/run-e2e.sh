@@ -613,6 +613,10 @@ if [ "$FILESYSTEM" = "xfs+crypt" ]; then
         SWTPM_STATE_DIR=/tmp/swtpm-tpmstate
         SWTPM_SOCK=/tmp/swtpm-sock
         rm -rf "$SWTPM_STATE_DIR"
+        # A stale pidfile left by a prior run (possibly owned by another uid
+        # under /tmp's sticky bit) makes swtpm fail with "Could not open
+        # pidfile ... Permission denied"; clear it before (re)starting.
+        rm -f /tmp/swtpm.pid /tmp/swtpm-sock
         mkdir -p "$SWTPM_STATE_DIR"
         swtpm socket --tpm2 \
             --tpmstate dir="$SWTPM_STATE_DIR" \
