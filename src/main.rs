@@ -82,13 +82,77 @@ enum Command {
 }
 
 fn check_root_privilege() -> Result<()> {
-    let uid = unsafe { libc::getuid() };
-    if uid != 0 {
+    if !rustix::process::getuid().is_root() {
         return Err(anyhow!(
             "This command must be run as root (e.g., using sudo)."
         ));
     }
     Ok(())
+}
+
+/// Redirect this process's stdout/stderr through a pipe to a background thread
+/// that fans every chunk out to both the real terminal and `log_file`.
+///
+/// Best-effort: returns an error if the pipe/dup setup fails, in which case the
+/// caller proceeds without persistent logging.
+/// Holds the tee thread + a copy of the real stdout. Call [`TeeGuard::finish`]
+/// before the process exits so short-lived commands (`commit --dry-run`) don't
+/// lose their stdout: the thread only sees EOF once every writer of the pipe is
+/// closed, which on a fast exit races process teardown.
+#[derive(Debug)]
+struct TeeGuard {
+    handle: std::thread::JoinHandle<()>,
+    real_stdout: rustix::fd::OwnedFd,
+}
+
+impl TeeGuard {
+    /// Flush, restore the real stdout/stderr (closing the pipe so the tee thread
+    /// sees EOF), and wait for the thread to drain everything to stdout + log.
+    fn finish(self) {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        let _ = rustix::stdio::dup2_stdout(&self.real_stdout);
+        let _ = rustix::stdio::dup2_stderr(&self.real_stdout);
+        let _ = self.handle.join();
+    }
+}
+
+fn tee_stdio_to_log(log_file: std::fs::File) -> rustix::io::Result<TeeGuard> {
+    use std::io::{Read, Write};
+
+    let (pipe_read, pipe_write) = rustix::pipe::pipe()?;
+    // One dup for the tee thread to reach the terminal, one kept by the guard to
+    // restore fd 1/2 on shutdown (which closes the pipe and unblocks the thread).
+    let thread_stdout = rustix::io::dup(rustix::stdio::stdout())?;
+    let real_stdout = rustix::io::dup(rustix::stdio::stdout())?;
+
+    let handle = std::thread::spawn(move || {
+        let mut reader = std::fs::File::from(pipe_read);
+        let mut stdout = std::fs::File::from(thread_stdout);
+        let mut log = log_file;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = log.write_all(&buf[..n]);
+            let _ = stdout.write_all(&buf[..n]);
+        }
+        let _ = log.flush();
+        let _ = stdout.flush();
+    });
+
+    rustix::stdio::dup2_stdout(&pipe_write)?;
+    rustix::stdio::dup2_stderr(&pipe_write)?;
+    // Dropping our copy of the write end leaves only the redirected stdout/stderr
+    // referencing it, so the tee thread sees EOF once those close (process exit
+    // or TeeGuard::finish).
+    drop(pipe_write);
+    Ok(TeeGuard {
+        handle,
+        real_stdout,
+    })
 }
 
 fn main() {
@@ -112,45 +176,19 @@ fn main() {
         }
     };
 
-    // Tee stdout+stderr to log file via a pipe so output is visible both
+    // Tee stdout+stderr to the log file via a pipe so output is visible both
     // on the terminal (over SSH for E2E) and in the persistent log.
-    if let Some(log_file) = log_file {
-        use std::os::unix::io::FromRawFd;
-        let mut pipe_fds = [-1i32; 2];
-        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0 {
-            let pipe_read = pipe_fds[0];
-            let pipe_write = pipe_fds[1];
-            // Save original stdout fd so the tee thread can write to the
-            // real terminal even after we dup2 the pipe over stdout/stderr.
-            let orig_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
-            std::thread::spawn(move || {
-                use std::io::{Read, Write};
-                let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_read) };
-                let mut stdout = unsafe { std::fs::File::from_raw_fd(orig_stdout) };
-                let mut log = log_file;
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = log.write_all(&buf[..n]);
-                            let _ = stdout.write_all(&buf[..n]);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            unsafe {
-                libc::dup2(pipe_write, libc::STDOUT_FILENO);
-                libc::dup2(pipe_write, libc::STDERR_FILENO);
-                libc::close(pipe_write);
-            }
-        }
-    }
+    let mut tee_guard = log_file.and_then(|f| tee_stdio_to_log(f).ok());
 
-    // Handle --commit subcommand (#8)
+    // Handle --commit subcommand
     if let Some(Command::Commit { dry_run }) = args.command {
-        if let Err(e) = run_commit(dry_run) {
+        let result = run_commit(dry_run);
+        // Drain the tee thread so the (short-lived) command's stdout reaches the
+        // caller before we exit — otherwise the cleanup report is lost.
+        if let Some(g) = tee_guard.take() {
+            g.finish();
+        }
+        if let Err(e) = result {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -159,7 +197,11 @@ fn main() {
 
     // Handle --undo subcommand
     if let Some(Command::Undo { dry_run, full }) = args.command {
-        if let Err(e) = run_undo(dry_run, full) {
+        let result = run_undo(dry_run, full);
+        if let Some(g) = tee_guard.take() {
+            g.finish();
+        }
+        if let Err(e) = result {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
@@ -176,7 +218,7 @@ fn main() {
         process::exit(1);
     });
 
-    // Fix 1: validate target_image to prevent INI injection in .origin file.
+    // Validate target_image to prevent INI injection in the .origin file.
     if target_image.contains('\n') || target_image.contains('\r') || target_image.contains('\0') {
         eprintln!("Error: --target-image contains invalid characters (newlines, nulls).");
         process::exit(1);
@@ -402,7 +444,7 @@ fn main() {
     }
 }
 
-/// Commit the composefs deployment as the permanent default (#8).
+/// Commit the composefs deployment as the permanent default.
 fn run_commit(dry_run: bool) -> Result<()> {
     check_root_privilege()?;
     println!("=== Committing composefs deployment as permanent default ===");
@@ -422,7 +464,7 @@ fn run_commit(dry_run: bool) -> Result<()> {
         );
     }
 
-    // Fix 6: detect bootloader — check ESP entries for systemd-boot first.
+    // Detect bootloader — check ESP entries for systemd-boot first.
     let esp_candidates = ["/boot/efi", "/efi"];
     let mut entries_dir = PathBuf::from("/boot/loader/entries");
     let mut is_systemd_boot = false;
@@ -431,15 +473,15 @@ fn run_commit(dry_run: bool) -> Result<()> {
         let esp_entries = Path::new(esp).join("loader/entries");
         if esp_entries.exists() {
             // Check if there are bootc_ entries on the ESP.
-            if let Ok(mut rd) = std::fs::read_dir(&esp_entries) {
-                if rd.any(|e| {
+            if let Ok(mut rd) = std::fs::read_dir(&esp_entries)
+                && rd.any(|e| {
                     e.map(|en| en.file_name().to_string_lossy().starts_with("bootc_"))
                         .unwrap_or(false)
-                }) {
-                    entries_dir = esp_entries;
-                    is_systemd_boot = true;
-                    break;
-                }
+                })
+            {
+                entries_dir = esp_entries;
+                is_systemd_boot = true;
+                break;
             }
         }
     }
@@ -459,6 +501,33 @@ fn run_commit(dry_run: bool) -> Result<()> {
     // ESP at /boot/efi or /efi (common in E2E QEMU runs).
     if !composefs_entries.is_empty() {
         is_systemd_boot = true;
+    }
+
+    // Fallback: the ESP may be unmounted or at a non-standard path
+    // (e.g. after LUKS migration where Phase 5 auto-mounted it at
+    // /var/tmp/esp-migration and the boot-time fstab doesn't know about
+    // it). Try auto-mounting the ESP by partition type GUID.
+    if composefs_entries.is_empty()
+        && let Ok(esp_path) = crate::migration::find_esp_or_mount()
+    {
+        let esp_entries = Path::new(&esp_path).join("loader/entries");
+        if esp_entries.exists() {
+            for entry in std::fs::read_dir(&esp_entries)? {
+                let entry = entry?;
+                let name_str = entry.file_name().to_string_lossy().into_owned();
+                if name_str.starts_with("bootc_") {
+                    composefs_entries.push(name_str);
+                }
+            }
+            if !composefs_entries.is_empty() {
+                entries_dir = esp_entries;
+                is_systemd_boot = true;
+                println!(
+                    "Found composefs BLS entries on auto-mounted ESP at {}",
+                    esp_path
+                );
+            }
+        }
     }
 
     if composefs_entries.is_empty() {
@@ -527,7 +596,7 @@ fn run_commit(dry_run: bool) -> Result<()> {
     }
 
     // --- Full OSTree-side cleanup so the on-disk layout matches a fresh
-    //     bootc install of the target image (#25). ---
+    //     bootc install of the target image. ---
     // /sysroot is typically read-only on a composefs-booted system.
     // Even after remount rw, the composefs EROFS overlay blocks mutation
     // of paths that are pinned by the metadata tree (e.g. /sysroot/ostree).
@@ -565,6 +634,14 @@ fn run_commit(dry_run: bool) -> Result<()> {
             "stale Bluefin install-provenance marker",
             dry_run,
         );
+    }
+
+    // /boot may be read-only under composefs (e.g. separate ext4 /boot partition
+    // on LUKS where the initramfs mounts it ro). Remount rw before cleanup.
+    if !dry_run {
+        let _ = std::process::Command::new("mount")
+            .args(["-o", "remount,rw", "/boot"])
+            .status();
     }
 
     // 2. Stale OSTree BLS entries under /boot/loader/entries. The ESP-side
@@ -781,24 +858,24 @@ fn run_undo(dry_run: bool, full: bool) -> Result<()> {
 
     // 1. Remove staged composefs deployments.
     let deploy_dir = Path::new("/sysroot/state/deploy");
-    if deploy_dir.exists() {
-        if let Ok(rd) = std::fs::read_dir(deploy_dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                // Skip the OSTree deploy dir (numeric or short names).
-                // Composefs deploy dirs are long hex strings (64+ chars).
-                if name.len() < 40 {
-                    continue;
+    if deploy_dir.exists()
+        && let Ok(rd) = std::fs::read_dir(deploy_dir)
+    {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Skip the OSTree deploy dir (numeric or short names).
+            // Composefs deploy dirs are long hex strings (64+ chars).
+            if name.len() < 40 {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                println!("Removing staged deployment: {}", path.display());
+                if !dry_run {
+                    std::fs::remove_dir_all(&path)
+                        .with_context(|| format!("failed to remove {}", path.display()))?;
                 }
-                let path = entry.path();
-                if path.is_dir() {
-                    println!("Removing staged deployment: {}", path.display());
-                    if !dry_run {
-                        std::fs::remove_dir_all(&path)
-                            .with_context(|| format!("failed to remove {}", path.display()))?;
-                    }
-                    removed += 1;
-                }
+                removed += 1;
             }
         }
     }
@@ -825,19 +902,19 @@ fn run_undo(dry_run: bool, full: bool) -> Result<()> {
 
     // 3. Remove composefs BLS entries from /boot/loader/entries.
     let bls_dir = Path::new("/boot/loader/entries");
-    if bls_dir.exists() {
-        if let Ok(rd) = std::fs::read_dir(bls_dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("bootc_") || name.starts_with("ostree-fallback-") {
-                    let path = entry.path();
-                    println!("Removing BLS entry: {}", path.display());
-                    if !dry_run {
-                        std::fs::remove_file(&path)
-                            .with_context(|| format!("failed to remove {}", path.display()))?;
-                    }
-                    removed += 1;
+    if bls_dir.exists()
+        && let Ok(rd) = std::fs::read_dir(bls_dir)
+    {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("bootc_") || name.starts_with("ostree-fallback-") {
+                let path = entry.path();
+                println!("Removing BLS entry: {}", path.display());
+                if !dry_run {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("failed to remove {}", path.display()))?;
                 }
+                removed += 1;
             }
         }
     }
@@ -880,19 +957,19 @@ fn run_undo(dry_run: bool, full: bool) -> Result<()> {
             }
         }
         let esp_linux = Path::new(esp).join("EFI/Linux");
-        if esp_linux.exists() {
-            if let Ok(rd) = std::fs::read_dir(&esp_linux) {
-                for entry in rd.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with("bootc_composefs-") {
-                        let path = entry.path();
-                        println!("Removing ESP EFI/Linux entry: {}", path.display());
-                        if !dry_run {
-                            std::fs::remove_dir_all(&path)
-                                .with_context(|| format!("failed to remove {}", path.display()))?;
-                        }
-                        removed += 1;
+        if esp_linux.exists()
+            && let Ok(rd) = std::fs::read_dir(&esp_linux)
+        {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("bootc_composefs-") {
+                    let path = entry.path();
+                    println!("Removing ESP EFI/Linux entry: {}", path.display());
+                    if !dry_run {
+                        std::fs::remove_dir_all(&path)
+                            .with_context(|| format!("failed to remove {}", path.display()))?;
                     }
+                    removed += 1;
                 }
             }
         }

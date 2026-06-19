@@ -1,5 +1,7 @@
 # bootc-migrate-composefs
 
+[![CI](https://github.com/hanthor/bootc-migrate-composefs/actions/workflows/ci.yml/badge.svg)](https://github.com/hanthor/bootc-migrate-composefs/actions/workflows/ci.yml)
+
 In-place migration utility that converts an OSTree-backend bootc system
 (e.g. Bluefin) into a ComposeFS-backend bootc system (e.g. Dakota), without
 reinstalling and without losing `/home`, `/var`, `/etc` customizations,
@@ -105,7 +107,7 @@ Things to confirm in the report:
 - `ESP Free Space: ≥ 150 MB` — we extract `systemd-bootx64.efi` from the
   target image onto the ESP.
 - `Btrfs Filesystem: Yes` + `Reflink (CoW) Support: Yes` — xfs is tracked
-  in [#16](https://github.com/hanthor/ostree-composefs-rebase/issues/16),
+  in [#16](https://github.com/hanthor/bootc-migrate-composefs/issues/16),
   not supported yet.
 - `ComposeFS free space: ≥ 1.1 × ostree_repo_size` — the composefs object
   store is built by reflinking your existing OSTree objects.
@@ -247,7 +249,7 @@ What's intentionally *not* carried forward:
 - UEFI firmware with writable NVRAM (for the systemd-boot path; GRUB2 fallback
   works on BIOS)
 - Btrfs sysroot with reflink/CoW support (xfs tracked in
-  [#16](https://github.com/hanthor/ostree-composefs-rebase/issues/16))
+  [#16](https://github.com/hanthor/bootc-migrate-composefs/issues/16))
 - ESP with ≥150 MB free
 - ≥ `1.1 × ostree_repo_size` free on `/sysroot/composefs` (no reflink: 1.5×)
 
@@ -284,6 +286,18 @@ Overridable via env: `BASE_IMAGE`, `TARGET_IMAGE`, `DISK_SIZE`, `SKIP_SETUP`.
 - [SPECIFICATION.md](SPECIFICATION.md) — design doc
 - [HANDOFF.md](HANDOFF.md) — current status, open issues, recent decisions
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup and
+[REVIEW.md](REVIEW.md) for the code-review expectations. Run `just check` (clippy,
+rustfmt, unit tests, shellcheck) before opening a PR. AI-assisted contributions
+should follow [AGENTS.md](AGENTS.md).
+
 ## License
 
-TBD.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the Apache-2.0 license, shall
+be dual-licensed as above, without any additional terms or conditions.
