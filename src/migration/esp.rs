@@ -1,9 +1,11 @@
 use crate::preflight::PreflightReport;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Determine the ESP device by partition label or type GUID.
+/// Returns the device path (e.g. "/dev/vda2") or None.
 pub(crate) fn find_esp_device() -> Option<String> {
     // Try the by-partlabel symlink (works inside VMs without lsblk sudo).
     let by_label = Path::new("/dev/disk/by-partlabel/EFI-SYSTEM");
@@ -29,6 +31,53 @@ pub(crate) fn find_esp_device() -> Option<String> {
         }
     }
     None
+}
+
+/// Find the ESP partition and return its mount point, auto-mounting it
+/// under /var/tmp/esp-migration if it is not already mounted. Does not
+/// require a PreflightReport — use from the commit/cleanup path where
+/// the preflight context is not available.
+pub(crate) fn find_esp_or_mount() -> Result<String> {
+    // Check standard mount points first.
+    for path in ["/boot/efi", "/efi"] {
+        if Path::new(path).exists() && Path::new(path).join("EFI").exists() {
+            return Ok(path.to_string());
+        }
+    }
+
+    // Scan lsblk: if the ESP is already mounted at a non-standard path,
+    // return that mount point.
+    let output = Command::new("lsblk")
+        .args(["-o", "NAME,PARTTYPE,MOUNTPOINT", "-l", "-n"])
+        .output()
+        .context("failed to run lsblk")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3
+            && parts[1] == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+            && !parts[2].is_empty()
+        {
+            let mp = parts[2].to_string();
+            println!("Found ESP already mounted at {}", mp);
+            return Ok(mp);
+        }
+    }
+
+    // Not mounted — find device and mount it.
+    let device = find_esp_device()
+        .ok_or_else(|| anyhow!("No ESP device found by partition label or type GUID"))?;
+    let mount_point = "/var/tmp/esp-migration";
+    fs::create_dir_all(mount_point)?;
+    let status = Command::new("mount")
+        .args([&device, mount_point])
+        .status()
+        .with_context(|| format!("failed to mount ESP {} at {}", device, mount_point))?;
+    if status.success() {
+        println!("Auto-mounted ESP {} at {}", device, mount_point);
+        return Ok(mount_point.to_string());
+    }
+    bail!("Cannot find or mount ESP. Use --bootloader=grub2 to use GRUB2 instead.")
 }
 
 /// Main migration entry point. Orchestrates all 5 phases.
