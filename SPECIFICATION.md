@@ -625,17 +625,30 @@ To prevent bricking the system in case of bootloader failure, the switch is stag
 
 ```mermaid
 graph TD
-    A[Booted in Bluefin: OSTree + GRUB2] --> B[Run Preflight Checks: ESP size, UEFI, Secure Boot]
-    B -- Valid --> C[Install systemd-boot to ESP in non-default slot]
-    B -- Invalid --> C1[Abort bootloader switch / Boot via GRUB2 + ComposeFS BLS Type 1]
-    C --> D[Copy Dakota kernel + initrd/UKI to ESP]
-    D --> E[Write ComposeFS BLS entry to ESP loader/entries/]
-    E --> F[Retain old GRUB2 boot configs on /boot]
-    F --> G[Run efibootmgr to register systemd-boot as #1 boot target]
-    G --> H[Reboot System]
-    H --> I{Boots successfully via systemd-boot?}
-    I -- Yes --> J[Run bootc internals cleanup: remove old GRUB2 configurations & OSTree deployments]
-    I -- No --> K[User selects GRUB2 in UEFI boot menu -> boots back to rollback OSTree deployment]
+    A["Booted in Bluefin<br/>OSTree + GRUB2"] --> B["Run preflight checks<br/>ESP size &middot; UEFI &middot; Secure Boot"]
+    B -- Valid --> C["Install systemd-boot to ESP<br/>in non-default slot"]
+    B -- Invalid --> C1["Abort bootloader switch<br/>boot via GRUB2 + ComposeFS BLS Type 1"]
+    C --> D["Copy Dakota kernel + initrd/UKI to ESP"]
+    D --> E["Write ComposeFS BLS entry<br/>to ESP /loader/entries/"]
+    E --> F["Retain old GRUB2 boot configs on /boot"]
+    F --> G["efibootmgr: register systemd-boot<br/>as #1 boot target"]
+    G --> H["Reboot system"]
+    H --> I{"Boots via<br/>systemd-boot?"}
+    I -- Yes --> J["bootc internals cleanup<br/>remove old GRUB2 configs &amp; OSTree deployments"]
+    I -- No --> K["User selects GRUB2 in UEFI boot menu<br/>&rarr; rolls back to OSTree deployment"]
+
+    %% ── Status colours ──────────────────────────────────────────
+    classDef start fill:#e3f0ff,stroke:#3b82c4,color:#0b2545;
+    classDef step fill:#fff4e0,stroke:#d9920b,color:#5a3a00;
+    classDef decision fill:#fef9c3,stroke:#ca8a04,color:#422006;
+    classDef good fill:#e4f7e7,stroke:#3ca34a,color:#06311a;
+    classDef bad fill:#fde2e2,stroke:#d64545,color:#5a0b0b;
+
+    class A start;
+    class B,C,D,E,F,G,H step;
+    class I decision;
+    class J good;
+    class C1,K bad;
 ```
 
 1. **Stage systemd-boot Binaries**:
