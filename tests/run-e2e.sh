@@ -561,7 +561,11 @@ sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
 LOOP_DEV=""
 echo "Disk image initialized and customized."
 # Save checkpoint for faster re-runs (skip disk creation + install).
-cp disk.raw "$CHECKPOINT"
+# LUKS runs skip this checkpoint on restore (it needs fresh setup), and
+# root-owned disk.raw can't cp into a user-owned workspace — non-fatal.
+if [ "$FILESYSTEM" != "xfs+crypt" ]; then
+    cp disk.raw "$CHECKPOINT" 2>/dev/null || true
+fi
 
 # 6. Launch QEMU VM
 step "=== Booting VM under QEMU ==="
