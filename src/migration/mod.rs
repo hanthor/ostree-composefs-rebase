@@ -194,7 +194,7 @@ pub fn run_migration(
     let (_manifest_digest, config_digest) = phase2_pull_image(target_image, dry_run)?;
 
     // ---- Phase 3: Create and seal EROFS image ----
-    let verity = phase3_create_image(&config_digest, dry_run)?;
+    let (verity, sealed_config) = phase3_create_image(&config_digest, dry_run)?;
 
     // ---- Phase 4: Stage deployment state ----
     let _deploy_dir = phase4_stage_deploy(
@@ -202,11 +202,20 @@ pub fn run_migration(
         target_image,
         &_manifest_digest,
         &config_digest,
+        &sealed_config,
         dry_run,
     )?;
 
     // ---- Phase 5: Setup bootloader ----
-    phase5_setup_bootloader(report, &verity, target_image, dry_run, bootloader, force)?;
+    phase5_setup_bootloader(
+        report,
+        &verity,
+        target_image,
+        &sealed_config,
+        dry_run,
+        bootloader,
+        force,
+    )?;
 
     // ---- Verification: confirm artifacts before claiming success ----
     if !dry_run {
@@ -380,7 +389,14 @@ fn phase2_pull_image(target_image: &str, dry_run: bool) -> Result<(String, Strin
 
 // ---- Phase 3 ----
 
-fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDigest> {
+/// Returns `(rootfs_verity, sealed_config_digest)`. The rootfs verity is the
+/// composefs image object ID used in `.origin`/BLS for the boot-time root
+/// mount; the sealed config digest (`sha256:…`) is the *manifest stream*
+/// identifier that `bootc … cfs oci mount` requires (it prepends
+/// `oci-config-` and looks up `streams/oci-config-<digest>`). These are
+/// distinct: passing the rootfs verity to `mount` looks up a nonexistent
+/// `oci-config-<verity>` stream and forces the zero-filling raw-EROFS fallback.
+fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<(VerityDigest, String)> {
     println!("=== Phase 3: Creating ComposeFS EROFS Image ===");
 
     if dry_run {
@@ -388,8 +404,11 @@ fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDiges
             "[DRY RUN] Would create and seal composefs image for config: {}",
             config_digest
         );
-        return Ok(VerityDigest::from_hex(
-            "dryrun0000000000000000000000000000000000000000000000000000000000",
+        return Ok((
+            VerityDigest::from_hex(
+                "dryrun0000000000000000000000000000000000000000000000000000000000",
+            ),
+            config_digest.to_string(),
         ));
     }
 
@@ -405,15 +424,22 @@ fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDiges
         verity.as_hex()
     );
 
-    // The `bootc internals cfs seal` command creates the `oci-config-<verity>`
-    // stream in the composefs object store, which the initramfs needs for
-    // proper composefs user-space mounting (without it, bootc falls back to
-    // raw kernel EROFS mount which zero-fills files above the inline threshold,
-    // causing missing unit files like dbus.service and cascading boot failures).
+    // `bootc … cfs oci seal` clones the manifest with the embedded verity digest
+    // and prints the *sealed* manifest's `config <sha256:…>` line. That sealed
+    // config digest — NOT the rootfs verity above — is what `cfs oci mount`
+    // needs; without using it, mount fails and bootc falls back to a raw kernel
+    // EROFS mount which zero-fills files above the inline threshold (causing
+    // missing unit files like dbus.service and cascading boot failures).
     // Always seal — idempotency is handled inside bootc.
     println!("Sealing composefs image...");
-    crate::composefs::seal_image(config_digest).context("failed to seal composefs image")?;
-    println!("Image sealed successfully.");
+    let seal_out =
+        crate::composefs::seal_image(config_digest).context("failed to seal composefs image")?;
+    let sealed_config = seal_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("config "))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| anyhow!("seal output missing 'config <digest>' line; got:\n{seal_out}"))?;
+    println!("Image sealed successfully (sealed config: {sealed_config}).");
 
     // Write meta.json to the composefs repository so that
     // bootc-root-setup.service can open it in the initramfs.
@@ -424,7 +450,7 @@ fn phase3_create_image(config_digest: &str, dry_run: bool) -> Result<VerityDiges
         println!("  Wrote composefs meta.json");
     }
 
-    Ok(verity)
+    Ok((verity, sealed_config))
 }
 
 // ---- Phase 4 (#4, #5, #7) ----

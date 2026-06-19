@@ -1,7 +1,7 @@
 use crate::VerityDigest;
 use crate::migration::mount_image;
 use crate::migration::phase0::MountGuard;
-use crate::migration::registry::{extract_files_via_registry, extract_subtree_via_registry};
+use crate::migration::registry::{extract_files_preferring_mount, extract_subtree_via_registry};
 use crate::xattr;
 use anyhow::{Context, Result, anyhow};
 use std::fs;
@@ -50,6 +50,7 @@ pub(crate) fn phase4_stage_deploy(
     target_image: &str,
     manifest_digest: &str,
     config_digest: &str,
+    sealed_config: &str,
     dry_run: bool,
 ) -> Result<PathBuf> {
     println!("=== Phase 4: Staging Deployment State ===");
@@ -85,7 +86,7 @@ pub(crate) fn phase4_stage_deploy(
 
     // 3-way /etc merge
     println!("Performing 3-way /etc merge...");
-    if let Err(e) = perform_etc_merge(verity, target_image, &etc_dir) {
+    if let Err(e) = perform_etc_merge(target_image, sealed_config, &etc_dir) {
         eprintln!(
             "3-way /etc merge failed ({}), falling back to flat /etc copy.",
             e
@@ -225,51 +226,46 @@ fn resolve_device_uuid(device: &str) -> Option<String> {
 
 /// Perform 3-way /etc merge: old OSTree default, current live /etc, new ComposeFS default.
 pub(crate) fn perform_etc_merge(
-    verity: &VerityDigest,
     target_image: &str,
+    sealed_config: &str,
     etc_dir: &Path,
 ) -> Result<()> {
-    // Mount the EROFS image for directory listing / symlink-target validation.
-    // The EROFS mount correctly exposes file NAMES and METADATA (stat, readdir,
-    // readlink) but ALL file CONTENT reads as zeros through the bare EROFS mount.
-    // The bootc overlay mount (bootc cfs mount) would fix this but fails because
-    // the oci-config-* stream is missing from the composefs repo when the image
-    // was sealed by our migration rather than by bootc's own pipeline.
+    // Mount the target rootfs via bootc's composefs overlay mount. We pass the
+    // *sealed config digest* (not the rootfs verity): `cfs oci mount` looks up
+    // `streams/oci-config-<sealed-config>`, so the rootfs verity would miss and
+    // drop us to a raw EROFS mount that zero-fills file content above the inline
+    // threshold. With the sealed digest the overlay exposes real file content,
+    // so the merge source below can read /etc directly off the mount.
     let temp_mount =
         TempDir::new_in("/var/tmp").context("failed to create temp mount directory")?;
     let mount_path = temp_mount.path().to_path_buf();
-    mount_image(verity.as_hex(), &mount_path).context("failed to mount EROFS for etc merge")?;
+    mount_image(sealed_config, &mount_path)
+        .context("failed to mount target composefs for etc merge")?;
     let _guard = MountGuard::new(&mount_path);
 
     let old_default_etc = find_ostree_etc_default()?;
     let current_etc = Path::new("/etc");
 
-    // Extract the target image's /etc tree from the OCI registry. The EROFS mount
-    // gives zero-filled file content for everything, so we must use registry streaming
-    // for real file content. This downloads ~120 layers but is the only reliable path.
-    let registry_etc =
-        TempDir::new_in("/var/tmp").context("failed to create temp dir for registry etc")?;
-    let registry_etc_path = registry_etc.path().join("etc");
-    println!("[phase4] extracting target /etc from registry...");
-    if let Err(e) = extract_subtree_via_registry(target_image, "/etc", &registry_etc_path) {
-        eprintln!(
-            "[phase4] warning: registry /etc extraction failed: {e:#} — falling back to EROFS"
-        );
-        // Last-resort fallback: EROFS mount for merge source.
-        let new_default_etc = mount_path.join("etc");
-        if !new_default_etc.exists() {
-            anyhow::bail!("no /etc in new composefs image");
-        }
-        crate::mergetc::merge_etc_files(&old_default_etc, current_etc, &new_default_etc, etc_dir)
+    // Use the target image's /etc straight off the sealed composefs overlay
+    // mount, which now exposes real file content. (Previously this had to stream
+    // ~120 layers from the registry because the mount was in bare-EROFS mode and
+    // zero-filled file content; that path is kept only as a fallback for when
+    // /etc is somehow absent from the mount.)
+    let mount_etc = mount_path.join("etc");
+    let mount_etc_usable = fs::read_dir(&mount_etc)
+        .map(|d| d.count() > 0)
+        .unwrap_or(false);
+    if mount_etc_usable {
+        println!("[phase4] using composefs-mounted /etc for merge source");
+        crate::mergetc::merge_etc_files(&old_default_etc, current_etc, &mount_etc, etc_dir)
             .context("3-way /etc merge failed")?;
     } else {
-        let entry_count = fs::read_dir(&registry_etc_path)
-            .map(|d| d.count())
-            .unwrap_or(0);
-        println!(
-            "[phase4] using registry-extracted /etc for merge source ({} entries)",
-            entry_count
-        );
+        let registry_etc =
+            TempDir::new_in("/var/tmp").context("failed to create temp dir for registry etc")?;
+        let registry_etc_path = registry_etc.path().join("etc");
+        println!("[phase4] /etc absent from mount; extracting target /etc from registry...");
+        extract_subtree_via_registry(target_image, "/etc", &registry_etc_path)
+            .context("registry /etc extraction failed")?;
         crate::mergetc::merge_etc_files(&old_default_etc, current_etc, &registry_etc_path, etc_dir)
             .context("3-way /etc merge failed")?;
     }
@@ -307,7 +303,7 @@ pub(crate) fn perform_etc_merge(
     // `User=dbus`, but Bluefin (which uses dbus-broker) has no `dbus` user.
     // Without this supplement, dbus-daemon fails with status 217/EXIT_USER
     // and the entire bus/polkit/logind/sshd stack cascade-fails.
-    if let Err(e) = supplement_identity_dbs_from_registry(target_image, etc_dir) {
+    if let Err(e) = supplement_identity_dbs(&mount_path, target_image, etc_dir) {
         eprintln!("[phase4] warning: identity-DB supplement failed: {e:#}");
     }
 
@@ -511,14 +507,12 @@ fn ensure_e2e_ssh_socket(etc_dir: &Path) -> Result<()> {
 }
 
 /// Supplement identity DBs and critical config files in the merged deploy
-/// /etc with target-image versions. Uses registry streaming (reliable) rather
-/// than the EROFS mount, which zero-fills content past ~4KB threshold
-/// (corrupting e.g. /etc/dbus-1/system.conf -> dbus fails to start, cascading
-/// to polkit/logind/sshd).
-///
-/// Batch-extracts all needed files in a single pass through layers (fast:
-/// ~8 min vs ~45 min for individual calls).
-fn supplement_identity_dbs_from_registry(target_image: &str, etc_dir: &Path) -> Result<()> {
+/// /etc with target-image versions. Reads them off the sealed composefs overlay
+/// mount (real content), falling back to registry streaming for anything absent
+/// from the mount. These files (e.g. /etc/dbus-1/system.conf, passwd) are
+/// load-bearing — a zero-filled dbus config makes dbus fail to start, cascading
+/// to polkit/logind/sshd.
+fn supplement_identity_dbs(mount_path: &Path, target_image: &str, etc_dir: &Path) -> Result<()> {
     let scratch =
         TempDir::new_in("/var/tmp").context("failed to create temp dir for identity-DB extract")?;
     // Batch all files into one single-pass extraction to avoid re-scanning
@@ -554,10 +548,10 @@ fn supplement_identity_dbs_from_registry(target_image: &str, etc_dir: &Path) -> 
         pairs.push((src.as_path(), dst.as_path()));
     }
 
-    // Single batch extract — one pass through all layers
-    if let Err(e) = extract_files_via_registry(target_image, &pairs) {
+    // Copy from the mount (real content), falling back to registry per missing file.
+    if let Err(e) = extract_files_preferring_mount(mount_path, target_image, &pairs) {
         // Log but don't fail — the merge may have produced valid content for some files.
-        eprintln!("[phase4] warning: batch registry extract failed: {e:#}");
+        eprintln!("[phase4] warning: identity-DB supplement failed: {e:#}");
     }
 
     // --- Supplement identity DBs (union-merge by first colon field) ---

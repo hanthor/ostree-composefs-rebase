@@ -96,6 +96,44 @@ fn try_extract_from_podman(image_ref: &str, files: &[(&Path, &Path)]) -> bool {
     all_ok
 }
 
+/// Copy files out of a mounted composefs image, falling back to registry
+/// streaming only for sources missing from the mount. Each pair is
+/// `(path-in-image starting with "/", destination)`. Now that Phase 3 seals the
+/// image and Phases 4/5 mount it by its sealed config digest, the composefs
+/// overlay exposes real file content — so the kernel, initrd, systemd-bootx64.efi
+/// etc. can be copied straight off the mount, removing the runtime dependency on
+/// reaching the image's upstream registry (which an offline/air-gapped target or
+/// a CI VM with no egress cannot satisfy).
+pub(crate) fn extract_files_preferring_mount(
+    mount_path: &Path,
+    image_ref: &str,
+    files: &[(&Path, &Path)],
+) -> Result<()> {
+    let mut missing: Vec<(&Path, &Path)> = Vec::new();
+    for (src, dest) in files {
+        let rel = src.strip_prefix("/").unwrap_or(src);
+        let from = mount_path.join(rel);
+        if !from.exists() {
+            missing.push((*src, *dest));
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent dir for {}", dest.display()))?;
+        }
+        fs::copy(&from, dest)
+            .with_context(|| format!("copying {} -> {}", from.display(), dest.display()))?;
+    }
+    if !missing.is_empty() {
+        println!(
+            "[extract] {} file(s) absent from composefs mount; falling back to registry",
+            missing.len()
+        );
+        extract_files_via_registry(image_ref, &missing)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn extract_files_via_registry(image_ref: &str, files: &[(&Path, &Path)]) -> Result<()> {
     let file_list: Vec<String> = files.iter().map(|(s, _)| s.display().to_string()).collect();
     println!(
@@ -393,6 +431,33 @@ pub(crate) fn extract_subtree_via_registry(
 /// stops once the filesystem drivers the composefs+LUKS+XFS initrd needs
 /// (xfs, erofs, overlay — shipped together in the kernel-modules layer)
 /// are present.
+/// Copy the target kernel's module tree out of a mounted composefs image into a
+/// writable scratch dir (depmod must write `modules.dep.bin`, and the mount is
+/// read-only). Returns the same `(scratch, modules_dir)` shape as
+/// [`extract_kernel_modules_via_registry`] so callers are interchangeable.
+/// Preferred over registry streaming: the sealed overlay mount already holds the
+/// real `.ko` content locally, so no network is required.
+pub(crate) fn copy_kernel_modules_from_mount(
+    mount_path: &Path,
+    kver: &str,
+) -> Result<(TempDir, PathBuf)> {
+    let src = mount_path.join("usr/lib/modules").join(kver);
+    if !src.join("kernel").is_dir() {
+        anyhow::bail!(
+            "kernel modules for {kver} not present in composefs mount at {}",
+            src.display()
+        );
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("bootc-migrate-kmods-")
+        .tempdir_in("/var/tmp")
+        .context("failed to create /var/tmp scratch dir for kernel modules")?;
+    let dst = scratch.path().join("usr/lib/modules").join(kver);
+    crate::xattr::copy_dir_all_with_xattrs(&src, &dst)
+        .with_context(|| format!("copying kernel modules from {}", src.display()))?;
+    Ok((scratch, dst))
+}
+
 pub(crate) fn extract_kernel_modules_via_registry(
     image_ref: &str,
     kver: &str,

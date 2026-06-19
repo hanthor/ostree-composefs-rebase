@@ -21,6 +21,7 @@ pub(crate) fn phase5_setup_bootloader(
     report: &PreflightReport,
     verity: &VerityDigest,
     target_image: &str,
+    sealed_config: &str,
     dry_run: bool,
     bootloader: &str,
     force: bool,
@@ -83,7 +84,10 @@ pub(crate) fn phase5_setup_bootloader(
         return Ok(());
     }
 
-    mount_image(verity.as_hex(), &mount_path)
+    // Mount via the sealed config digest (see phase4::perform_etc_merge): the
+    // rootfs verity would miss the oci-config stream and fall back to a raw
+    // EROFS mount that zero-fills kernel/initrd/systemd-bootx64.efi content.
+    mount_image(sealed_config, &mount_path)
         .context("failed to mount composefs image for boot artifacts")?;
     let _guard = MountGuard::new(&mount_path);
 
@@ -135,8 +139,7 @@ pub(crate) fn phase5_setup_bootloader(
 
         match install_systemd_boot_from_target(esp_path, &mount_path, target_image) {
             Ok(()) => {
-                // Copy composefs kernel+initrd to ESP via registry stream (raw EROFS reads
-                // return zero-filled content past the inline threshold).
+                // Copy composefs kernel+initrd from the sealed mount to the ESP.
                 let boot_dir_name = format!("bootc_composefs-{}", verity.as_hex());
                 let esp_boot_dir = esp_path.join("EFI/Linux").join(&boot_dir_name);
                 fs::create_dir_all(&esp_boot_dir)?;
@@ -163,9 +166,8 @@ pub(crate) fn phase5_setup_bootloader(
                 } else {
                     esp_initrd = PathBuf::new();
                 }
-                extract_files_via_registry(target_image, &extract).context(
-                    "failed to extract kernel/initrd from target image via registry stream",
-                )?;
+                extract_files_preferring_mount(&mount_path, target_image, &extract)
+                    .context("failed to copy kernel/initrd from target image")?;
 
                 // Rebuild initrd with LVM support if the source system uses LVM.
                 // Must happen before patch_origin_boot_digest so the hash covers
@@ -369,9 +371,8 @@ pub(crate) fn phase5_setup_bootloader(
         if have_grub_initrd {
             grub_extract.push((in_container_initrd.as_path(), grub_initrd_path.as_path()));
         }
-        extract_files_via_registry(target_image, &grub_extract).context(
-            "failed to extract kernel/initrd from target image via registry stream (grub2 path)",
-        )?;
+        extract_files_preferring_mount(&mount_path, target_image, &grub_extract)
+            .context("failed to copy kernel/initrd from target image (grub2 path)")?;
 
         let mut extra_initrd_grub: Option<String> = None;
         if have_grub_initrd {
@@ -520,8 +521,9 @@ fn install_systemd_boot_from_target(
     mount_path: &Path,
     target_image: &str,
 ) -> Result<()> {
-    // Probe via the EROFS mount only to confirm the file exists in the target image
-    // (file listing works fine on raw EROFS; it's the content reads that are corrupt).
+    // The sealed composefs overlay mount exposes real file content, so the
+    // systemd-boot binary is read straight off the mount (with a registry
+    // fallback for the unusual case where it's absent from the mount).
     let probe = mount_path.join("usr/lib/systemd/boot/efi/systemd-bootx64.efi");
     if !probe.exists() {
         return Err(anyhow!(
@@ -536,14 +538,15 @@ fn install_systemd_boot_from_target(
     fs::create_dir_all(&removable_dir)?;
 
     let sd_dst = sd_dir.join("systemd-bootx64.efi");
-    extract_files_via_registry(
+    extract_files_preferring_mount(
+        mount_path,
         target_image,
         &[(
             Path::new("/usr/lib/systemd/boot/efi/systemd-bootx64.efi"),
             &sd_dst,
         )],
     )
-    .context("failed to extract systemd-bootx64.efi from target image via registry stream")?;
+    .context("failed to install systemd-bootx64.efi from target image")?;
 
     // Mirror to removable-media path. Local copy of the freshly-extracted (real) bytes
     // is safe — no EROFS in the read path.
@@ -701,7 +704,7 @@ fn find_ostree_deployment() -> Result<(PathBuf, String)> {
 
 fn rebuild_initrd_with_lvm_if_needed(
     kver: &str,
-    _mount_path: &Path,
+    mount_path: &Path,
     initrd_dst: &Path,
     target_image: &str,
 ) -> Result<Option<String>> {
@@ -740,11 +743,10 @@ fn rebuild_initrd_with_lvm_if_needed(
             )
         })?;
 
-    // Extract Dakota kernel modules via registry streaming (layer-by-layer).
-    // The EROFS mount is in bare-EROFS mode so large files read as zeros.
-    // podman cp pulls the full image (~5 GB) into podman storage — ENOSPC.
-    // Registry streaming downloads one layer at a time, extracts the needed
-    // subtree, and drops the blob before the next. Peak disk: ~500 MB.
+    // Copy Dakota kernel modules into a writable scratch dir so depmod can write
+    // modules.dep.bin. Prefer the sealed composefs overlay mount (real .ko
+    // content, no network); fall back to registry streaming (layer-by-layer,
+    // ~500 MB peak) if the modules aren't present in the mount.
     let free = crate::preflight::get_free_space("/var/tmp").unwrap_or(0);
     if free < 1_500_000_000 {
         eprintln!(
@@ -753,8 +755,14 @@ fn rebuild_initrd_with_lvm_if_needed(
         );
         return Ok(None);
     }
-    let (kmod_dir, kmod_src) = extract_kernel_modules_via_registry(target_image, kver)
-        .context("failed to extract target kernel modules via registry")?;
+    let (kmod_dir, kmod_src) = match copy_kernel_modules_from_mount(mount_path, kver) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[phase5] kernel modules not available from mount ({e:#}); using registry");
+            extract_kernel_modules_via_registry(target_image, kver)
+                .context("failed to extract target kernel modules via registry")?
+        }
+    };
     // kmod_src points to <scratch>/usr/lib/modules/<kver> with real .ko
     // files and a valid modules.dep.bin.
     let kmoddir_arg = kmod_src;
@@ -812,18 +820,19 @@ fn rebuild_initrd_with_lvm_if_needed(
             Path::new("/usr/lib/bootc/initramfs-setup"),
             setup_dst.as_path(),
         )];
-        let setup_ok = match extract_files_via_registry(target_image, &extract_files) {
-            Ok(()) => {
-                // Make the binary executable — it must be run as /usr/lib/bootc/initramfs-setup
-                // in the initramfs, and the kernel's execve requires +x.
-                let _ = fs::set_permissions(&setup_dst, std::fs::Permissions::from_mode(0o755));
-                true
-            }
-            Err(e) => {
-                eprintln!("[phase5] Warning: could not extract initramfs-setup: {e}");
-                false
-            }
-        };
+        let setup_ok =
+            match extract_files_preferring_mount(mount_path, target_image, &extract_files) {
+                Ok(()) => {
+                    // Make the binary executable — it must be run as /usr/lib/bootc/initramfs-setup
+                    // in the initramfs, and the kernel's execve requires +x.
+                    let _ = fs::set_permissions(&setup_dst, std::fs::Permissions::from_mode(0o755));
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[phase5] Warning: could not extract initramfs-setup: {e}");
+                    false
+                }
+            };
         if setup_ok {
             println!("[phase5] bootc dracut module files prepared");
         }
