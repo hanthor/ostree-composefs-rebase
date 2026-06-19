@@ -1,16 +1,16 @@
 # bootc-migrate-composefs
 
-[![CI](https://github.com/hanthor/bootc-migrate-composefs/actions/workflows/ci.yml/badge.svg)](https://github.com/hanthor/bootc-migrate-composefs/actions/workflows/ci.yml)
+[![CI](https://github.com/hanthor/ostree-composefs-rebase/actions/workflows/ci.yml/badge.svg)](https://github.com/hanthor/ostree-composefs-rebase/actions/workflows/ci.yml)
 
 In-place migration utility that converts an OSTree-backend bootc system
 (e.g. Bluefin) into a ComposeFS-backend bootc system (e.g. Dakota), without
 reinstalling and without losing `/home`, `/var`, `/etc` customizations,
 flatpaks, container storage, or user accounts.
 
-> **Status: experimental.** End-to-end on Bluefin → Dakota works through
-> systemd-boot and a composefs root mount; the active workstream and current
-> blockers are tracked in [HANDOFF.md](HANDOFF.md). Don't point this at a
-> system you can't reinstall.
+> **Status: CI-validated.** All three E2E scenarios (btrfs, ext4, LUKS+XFS)
+> pass in CI on every push to `main` — migration, commit, deep-clean, and
+> bootc upgrade --check all green. Don't point this at a production machine
+> you can't reinstall, but the core path is stable.
 
 ## Architecture
 
@@ -27,9 +27,9 @@ flowchart TB
         P0["Phase 0: Preflight<br/>ESP size, NVRAM, reflink"]
         P1["Phase 1: OSTree import (opt)<br/>reflink objects into composefs store"]
         P2["Phase 2: OCI pull<br/>target image → composefs store"]
-        P3["Phase 3: EROFS seal<br/>build &amp; fs-verity sign image"]
-        P4["Phase 4: Stage deploy<br/>3-way /etc merge<br/>+ dangling-symlink prune<br/>+ identity-DB line-union<br/>+ /var copy<br/>+ .origin (tini)"]
-        P5["Phase 5: Bootloader<br/>stream sd-boot from OCI<br/>BLS entries on ESP<br/>register NVRAM"]
+        P3["Phase 3: EROFS seal<br/>build, seal, capture sealed config digest"]
+        P4["Phase 4: Stage deploy<br/>3-way /etc merge (via sealed mount)<br/>+ dangling-symlink prune<br/>+ identity-DB line-union<br/>+ /var copy<br/>+ .origin (tini)"]
+        P5["Phase 5: Bootloader<br/>copy sd-boot from sealed mount<br/>BLS entries on ESP<br/>register NVRAM"]
         P0 --> P1 --> P2 --> P3 --> P4 --> P5
     end
 
@@ -41,15 +41,23 @@ flowchart TB
     end
 
     S_USR -- "ostree object reflinks" --> P1
-    P2 -. "registry stream (layers)" .-> D_CFS
-    S_ETC -- "current/old/new merge" --> P4
+    P2 --> D_CFS
+    S_ETC -- "current/old/new merge (from mount)" --> P4
     P4 --> D_STATE
     S_VAR -- "verbatim copy<br/>(preserves containers, flatpaks, machine-id)" --> D_VAR
-    P5 -- "skopeo-style per-layer extract" --> D_BOOT
+    P3 -- "sealed config digest<br/>(not rootfs verity)" --> P4
+    P3 --> P5
+    P5 -- "copy from sealed mount" --> D_BOOT
     P5 -. "efibootmgr<br/>Linux Boot Manager" .-> NVRAM["UEFI NVRAM"]
 
     DST -. "reboot: systemd-boot → kernel<br/>cmdline composefs=&lt;verity&gt;" .-> RUN["Booted Dakota<br/>/ = composefs overlay (RO)<br/>/etc = writable from state/<br/>/var = writable from state/os/default/var"]
 ```
+
+**Key insight:** Phase 3 runs `bootc internals cfs oci seal` which prints the
+sealed manifest's config digest. Phases 4 and 5 pass that **sealed config
+digest** (not the rootfs verity) to `bootc cfs oci mount` — the overlay then
+exposes real file content for `/etc`, kernel, initrd, systemd-boot, and kernel
+modules, eliminating the need to re-stream OCI layers at runtime.
 
 ## What it does
 
@@ -59,15 +67,15 @@ Five phases, run as one command:
 2. **OSTree import** *(optional)* — reflinks existing OSTree file objects into
    the composefs object store so the pull in phase 2 is mostly dedup.
 3. **OCI pull** — `bootc internals cfs oci pull` of the target bootc image.
-4. **EROFS image** — builds and seals the composefs EROFS metadata image.
-5. **Stage deploy** — 3-way `/etc` merge with identity-DB line-union,
-   dangling `/usr/*` symlink pruning, `/var` data copy into
-   `state/os/default/var` so user data appears under the bootc initramfs
-   bind-mount, `.origin` (boot_digest, manifest_digest) written via tini.
-6. **Bootloader** — installs systemd-boot on the ESP (extracted from the
-   target image's OCI layers via direct registry streaming), writes BLS
-   entries, registers `Linux Boot Manager` in UEFI NVRAM, keeps the existing
-   OSTree GRUB entry as a fallback.
+4. **EROFS image** — builds, seals, and captures the sealed config digest.
+5. **Stage deploy** — 3-way `/etc` merge (read from sealed mount, no registry
+   streaming), identity-DB line-union, dangling `/usr/*` symlink pruning,
+   `/var` data copy into `state/os/default/var`, `.origin` (boot_digest,
+   manifest_digest) written via tini.
+6. **Bootloader** — copies `systemd-bootx64.efi` from the sealed mount to the
+   ESP (no registry streaming), writes BLS entries, registers
+   `Linux Boot Manager` in UEFI NVRAM. The original GRUB entry is left as a
+   rollback escape hatch.
 
 After a successful reboot into the composefs entry, `bootc-migrate-composefs
 commit` removes the OSTree fallback and makes composefs permanent.
@@ -104,11 +112,9 @@ Things to confirm in the report:
 - `Booted OSTree backend: Yes` — required; if `No` the tool refuses to run.
 - `UEFI Boot Mode: Yes` + `NVRAM writable: Yes` — required for the
   systemd-boot path; on BIOS-only or locked NVRAM pass `--bootloader grub2`.
-- `ESP Free Space: ≥ 150 MB` — we extract `systemd-bootx64.efi` from the
+- `ESP Free Space: ≥ 150 MB` — we copy `systemd-bootx64.efi` from the
   target image onto the ESP.
-- `Btrfs Filesystem: Yes` + `Reflink (CoW) Support: Yes` — xfs is tracked
-  in [#16](https://github.com/hanthor/bootc-migrate-composefs/issues/16),
-  not supported yet.
+- `Reflink (CoW) Support: Yes` — btrfs and XFS both support reflink.
 - `ComposeFS free space: ≥ 1.1 × ostree_repo_size` — the composefs object
   store is built by reflinking your existing OSTree objects.
 
@@ -128,8 +134,8 @@ phase headers print as it goes:
 | **1 — OSTree import** *(optional)* | Reflinks existing OSTree file objects into the composefs object store so Phase 2 mostly dedups | tens of seconds to a few minutes; skip with `--skip-import` |
 | **2 — OCI pull** | `bootc internals cfs oci pull` of the target image | minutes (network-bound) |
 | **3 — EROFS image** | Builds + fs-verity-signs the composefs metadata image | seconds |
-| **4 — Stage deploy** | 3-way `/etc` merge, dangling-symlink prune, identity-DB line-union, OSTree-era `/etc` cruft drop, `/var` copy to `state/os/default/var`, `.origin` file written | ~1 minute |
-| **5 — Bootloader** | Streams systemd-boot from target OCI layers (~1 GB peak), writes BLS entries, registers `Linux Boot Manager` in UEFI NVRAM | ~30s |
+| **4 — Stage deploy** | 3-way `/etc` merge (from sealed mount), dangling-symlink prune, identity-DB line-union, `/var` copy to `state/os/default/var`, `.origin` file written | ~1 minute |
+| **5 — Bootloader** | Copies systemd-boot from mounted image, writes BLS entries, registers NVRAM | ~30s |
 
 When it ends with `=== MIGRATION COMPLETED ===` the on-disk state is
 ready. Reboot:
@@ -145,7 +151,7 @@ Log in (your existing accounts and SSH keys still work) and check:
 ```bash
 cat /proc/cmdline                                       # must contain composefs=<hex>
 bootc status                                            # should report the composefs deployment
-bootc status --json | jq .status.booted.composefs       # non-null
+bootc status --json | jq .status.booted.composefs        # non-null
 ```
 
 Spend a day on it. Run your usual workflow — flatpaks, dnf, containers,
@@ -161,8 +167,9 @@ Once you trust the new system:
 sudo bootc-migrate-composefs commit
 ```
 
-This removes the OSTree fallback entry from the ESP. Rollback after this
-point is only via the still-present GRUB menu under `/boot/loader/entries/`.
+This removes the OSTree fallback from the ESP, drops GRUB2 boot artifacts,
+and reclaims ~14 GiB of OSTree object store. The systemd-boot entry becomes
+the sole default with timeout 0.
 
 ### Flags
 
@@ -186,7 +193,7 @@ deployment stays bootable:
 - Phase 4 *copies* `/var` to `state/os/default/var`; the OSTree side's `/var`
   is independent of the composefs side's after migration.
 - We push `Linux Boot Manager` (systemd-boot) to the front of NVRAM `BootOrder`
-  but the `Fedora` shim entry remains listed.
+  but the `Fedora` shim entry (which boots GRUB → OSTree) remains listed.
 
 To boot back into OSTree-Bluefin:
 
@@ -203,13 +210,12 @@ sudo systemctl reboot
 ```
 
 After running `bootc-migrate-composefs commit`, the OSTree fallback is removed
-from the ESP and rollback becomes one-way via the still-present GRUB entries
-under `/boot/loader/entries/`. The E2E test exercises the full round-trip
-(composefs → OSTree → composefs) on every run.
+from the ESP and rollback becomes a fresh install. The E2E test exercises the
+full round-trip (composefs → OSTree → composefs) on every run.
 
 ### What's preserved
 
-Validated end-to-end (21 assertions per run; see `tests/run-e2e.sh`):
+Validated end-to-end (21+ assertions per run; see `tests/run-e2e.sh`):
 
 - **/var data** — `/var/lib/*`, `/var/log/*`, `/var/cache/*`, containers,
   flatpak system installs, machine-id, hidden dirs and symlinks
@@ -238,20 +244,22 @@ What's intentionally *not* carried forward:
 |---|---|---|
 | Phase 0 refuses with "System is not booted into an OSTree deployment" | You're already on composefs (or a non-bootc system) | Nothing to do |
 | Phase 2 fails with ENOSPC mid-pull | `/sysroot/composefs` is tight on the 1.1× heuristic | Free space or grow the partition, then rerun |
-| Post-reboot `cat /proc/cmdline` shows `ostree=` not `composefs=` | Firmware ignored the new NVRAM entry | Use firmware boot menu to pick `Linux Boot Manager`; if that fails, fall back to OSTree and report the firmware quirk |
-| `bootc status` says "No manifest_digest in origin" | You're on an old build of this tool | Update — fixed in `aedd0c7` |
-| SSH key auth broken post-migration | Hit the now-fixed `.ssh` 755 bug, or you set the dir permissive yourself | Update (fixed in `ebd5aeb`); or boot OSTree fallback and `chmod 700 ~/.ssh` |
-| GNOME boots but session settings (wallpaper, accent) look wrong | Your dconf database needed compilation — bytes survived but GNOME hasn't re-read | `dconf update` as your user, or log out + back in |
+| Post-reboot `cat /proc/cmdline` shows `ostree=` not `composefs=` | Firmware ignored the new NVRAM entry, or OVMF loaded `Fedora\shim` instead | Use firmware boot menu to pick `Linux Boot Manager`; if that fails, fall back to OSTree and report the firmware quirk |
+| `bootc status` says "No manifest_digest in origin" | You're on an old build of this tool | Update to `main` — version info is on the first line of the migration log |
+| SSH key auth broken post-migration | Permissions changed during /var copy | Boot OSTree fallback and `chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys` |
+| GNOME boots but session settings (wallpaper, accent) look wrong | dconf database needs recompile | `dconf update` as your user, or log out + back in |
 
 ## Requirements
 
 - Booted on an OSTree-backed bootc system (Bluefin, Aurora, Silverblue…)
 - UEFI firmware with writable NVRAM (for the systemd-boot path; GRUB2 fallback
   works on BIOS)
-- Btrfs sysroot with reflink/CoW support (xfs tracked in
-  [#16](https://github.com/hanthor/bootc-migrate-composefs/issues/16))
+- Btrfs or XFS sysroot with reflink/CoW support
 - ESP with ≥150 MB free
 - ≥ `1.1 × ostree_repo_size` free on `/sysroot/composefs` (no reflink: 1.5×)
+- Outbound registry access for `bootc internals cfs oci pull`
+  (Phase 2 fetches the target image; Phases 4–5 read artifacts from the sealed
+  mount, so no runtime registry access is needed after Phase 2)
 
 ## Building
 
@@ -260,30 +268,35 @@ cargo build --release
 ```
 
 Drops a single binary at `target/release/bootc-migrate-composefs`.
+Requires Rust 1.85+ and a Linux host with `libxkbcommon-dev`.
 
 ## End-to-end tests
 
 A QEMU-based E2E harness lives in `tests/run-e2e.sh`. It installs Bluefin
-into a disk image, runs the migration against a local registry mirror of the
-Dakota target image, reboots, and validates the system came up on composefs.
+into a disk image, runs the migration against a registry mirror of the
+Dakota target image, reboots, and validates the full round-trip.
 
 ```
 sudo ./tests/run-e2e.sh
 ```
 
-Overridable via env: `BASE_IMAGE`, `TARGET_IMAGE`, `DISK_SIZE`, `SKIP_SETUP`.
+Overridable via env: `BASE_IMAGE`, `TARGET_IMAGE`, `DISK_SIZE`,
+`FILESYSTEM`, `SKIP_SETUP`. The CI matrix runs three scenarios:
+btrfs (default), ext4, and LUKS+XFS+crypt.
 
 ## Layout
 
-- `src/main.rs` — CLI surface (clap)
+- `src/main.rs` — CLI surface (clap), `commit` and `undo` subcommands
 - `src/preflight.rs` — environment validation
-- `src/migration/mod.rs` — five-phase orchestrator
+- `src/migration/mod.rs` — five-phase orchestrator (monolithic; uses rustix)
 - `src/composefs.rs` — wraps `bootc internals cfs`
 - `src/ostree.rs` — OSTree object scan + reflink import
 - `src/mergetc.rs` — 3-way `/etc` merge
-- `src/migration/bootloader.rs` — BLS entry generation
+- `src/migration/bootloader.rs` — BLS entry generation (systemd-boot + GRUB2)
+- `src/migration/esp.rs` — ESP device detection, auto-mount, efibootmgr
+- `src/migration/phases.rs` — phase-specific helpers (registry extraction,
+  initrd rebuild, kernel modules)
 - `tests/run-e2e.sh` — QEMU E2E harness
-- [SPECIFICATION.md](SPECIFICATION.md) — design doc
 - [HANDOFF.md](HANDOFF.md) — current status, open issues, recent decisions
 
 ## Contributing
