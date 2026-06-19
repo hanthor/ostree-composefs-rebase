@@ -264,68 +264,15 @@ pub(crate) fn phase5_setup_bootloader(
                      OSTree fallback available in the loader menu (3s timeout)."
                 );
 
-                // Also set GRUB's saved_entry so that if OVMF falls back
-                // to shim → GRUB (e.g. after NVRAM reset), it still boots
-                // composefs rather than Bluefin.
-                let entry_id = composefs_entry.filename.trim_end_matches(".conf");
-                let grubenv = "/boot/grub2/grubenv";
-                if Path::new(grubenv).exists() || Path::new("/boot/grub2/grub.cfg").exists() {
-                    if Command::new("grub2-editenv")
-                        .args([grubenv, "set", &format!("saved_entry={}", entry_id)])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                    {
-                        println!("  Set GRUB saved_entry={} (fallback boot path).", entry_id);
-                    } else if Command::new("grub2-set-default")
-                        .args([&entry_id])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                    {
-                        println!("  Set GRUB default to {} (fallback path).", entry_id);
-                    }
-                }
-
-                // Also write a GRUB-compatible composefs BLS entry to /boot/
-                // so GRUB can boot composefs (even when systemd-boot is used).
-                let boot_composefs_dir = Path::new("/boot").join(&boot_dir_name);
-                if !boot_composefs_dir.join("vmlinuz").exists() {
-                    fs::create_dir_all(&boot_composefs_dir).ok();
-                    // Copy files from ESP to /boot/ for GRUB access.
-                    let esp_src = esp_path.join("EFI/Linux").join(&boot_dir_name);
-                    for f in &["vmlinuz", "initrd", "xfs-mount.cpio"] {
-                        let src = esp_src.join(f);
-                        if src.exists() {
-                            let _ = fs::copy(&src, boot_composefs_dir.join(f));
-                        }
-                    }
-                    // Write a BLS entry with /boot-relative paths (GRUB needs these).
-                    let grub_bls = format!(
-                        "title Linux (composefs)\nversion 7.0.7\nlinux /boot/{}/vmlinuz\ninitrd /boot/{}/initrd\ninitrd /boot/{}/xfs-mount.cpio\noptions {}\nsort-key bootc-linux-0\n",
-                        boot_dir_name, boot_dir_name, boot_dir_name, options_str
-                    );
-                    let grub_entries = Path::new("/boot/loader/entries");
-                    fs::create_dir_all(grub_entries).ok();
-                    let _ = fs::write(grub_entries.join(&composefs_entry.filename), &grub_bls);
-                    println!(
-                        "  Wrote GRUB-compatible composefs BLS entry to /boot/loader/entries/"
-                    );
-
-                    // Inject set default="${saved_entry}" into grub.cfg so GRUB
-                    // boots composefs as the default.
-                    let grub_cfg = "/boot/grub2/grub.cfg";
-                    if let Ok(cfg) = fs::read_to_string(grub_cfg) {
-                        let default_kwd = "set default=\"${saved_entry}\"";
-                        if !cfg.contains(default_kwd) {
-                            let patched =
-                                cfg.replace("\nblscfg\n", &format!("\n{}\nblscfg\n", default_kwd));
-                            if patched != cfg {
-                                let _ = fs::write(grub_cfg, &patched);
-                            }
-                        }
-                    }
-                }
+                // Intentionally leave GRUB untouched. systemd-boot (registered
+                // in NVRAM, first in BootOrder) is the composefs primary; the
+                // original Fedora\shim → GRUB entry remains a rollback escape
+                // hatch that boots the pre-migration OSTree deployment. We do NOT
+                // repoint GRUB's saved_entry, add a composefs BLS entry under
+                // /boot/loader/entries, or patch grub.cfg — doing so would defeat
+                // that safety net (and a stray non-EFI composefs entry on the ESP
+                // also breaks `bootc status`). Trade-off: if firmware NVRAM is
+                // wiped, GRUB boots OSTree until systemd-boot is re-enrolled.
             }
             Err(e) => {
                 eprintln!(
