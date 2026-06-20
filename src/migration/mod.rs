@@ -802,7 +802,7 @@ fn phase4_stage_deploy(
     //   — bootc reads this to populate the BootEntry's image field.
     // - `manifest_digest` under [boot] lets bootc fetch the OCI manifest from
     //   the registry without a separate .imginfo file (`bootc internals cfs oci
-    //   inspect` is unreliable in our flow, see [HANDOFF.md]).
+    //   inspect` is unreliable in our flow).
     let origin_content = build_origin_content(target_image, verity, manifest_digest);
     fs::write(&origin_path, &origin_content).context("failed to write .origin file")?;
 

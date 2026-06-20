@@ -66,5 +66,4 @@ run; for CI use `gh run view --json jobs` to poll per-scenario results.
 ## Follow other guidelines
 
 Read [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md) and follow
-the contribution guidance there. Current project status and the active
-workstream live in [HANDOFF.md](HANDOFF.md).
+the contribution guidance there.
