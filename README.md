@@ -324,7 +324,6 @@ btrfs (default), ext4, and LUKS+XFS+crypt.
 - `src/migration/phases.rs` — phase-specific helpers (registry extraction,
   initrd rebuild, kernel modules)
 - `tests/run-e2e.sh` — QEMU E2E harness
-- [HANDOFF.md](HANDOFF.md) — current status, open issues, recent decisions
 
 ## Contributing
 
