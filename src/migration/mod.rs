@@ -250,6 +250,54 @@ fn detect_lvm() -> bool {
     }
 }
 
+/// Detect a dedicated `/var` filesystem (a separate partition/LV, anaconda's
+/// default), returning `(uuid, fstype)` of its backing device.
+///
+/// bootc's composefs boot bind-mounts the per-stateroot var
+/// (`/sysroot/state/os/default/var`, on the root fs) onto `/var` and *ignores*
+/// any `/var` fstab entry — so on a system where `/var` lives on its own volume,
+/// the composefs boot silently uses the empty stateroot var instead, losing the
+/// user's home, flatpaks, etc. We detect that case so Phase 5 can mount the real
+/// `/var` volume at the stateroot var path before bootc binds it (see
+/// [`prepare_stateroot_var_include`]).
+///
+/// "Separate" means the filesystem mounted at `/var` is a whole filesystem
+/// (FSROOT `/`), not a subtree bind of the root fs (e.g. btrfs `subvol=` or the
+/// ostree `…/var` bind, whose FSROOT is a subpath).
+fn detect_separate_var() -> Option<(String, String)> {
+    let out = Command::new("findmnt")
+        .args(["-no", "SOURCE,FSTYPE,FSROOT", "/var"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 3 {
+        return None;
+    }
+    let (source, fstype, fsroot) = (fields[0], fields[1], fields[2]);
+    if fsroot != "/" {
+        return None; // a subtree bind (subvol / ostree var), not a separate fs
+    }
+    let uuid = blkid_uuid(source)?;
+    Some((uuid, fstype.to_string()))
+}
+
+/// Resolve a block device's filesystem UUID via `blkid`.
+fn blkid_uuid(device: &str) -> Option<String> {
+    let out = Command::new("blkid")
+        .args(["-o", "value", "-s", "UUID", device])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let uuid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if uuid.is_empty() { None } else { Some(uuid) }
+}
+
 /// Rebuild the staged initrd with LVM/DM support using the host's dracut and
 /// Dakota's kernel modules from the composefs overlay mount.
 ///
@@ -301,6 +349,58 @@ fn prepare_composefs_loopback_include() -> Result<tempfile::TempDir> {
     Ok(tmp)
 }
 
+/// Build a scratch tree (for `dracut --include`) carrying a systemd mount unit
+/// that mounts the dedicated `/var` volume at the composefs stateroot var path
+/// (`/sysroot/state/os/default/var`) inside the initrd, ordered after
+/// sysroot.mount and before bootc-root-setup.service.
+///
+/// bootc-root-setup bind-mounts that path onto the deployment's `/var`, so
+/// overmounting it with the real `/var` volume here makes the user's data appear
+/// at `/var` — working around bootc composefs ignoring the `/var` fstab entry on
+/// systems with a dedicated `/var` partition/LV (see [`detect_separate_var`]).
+/// `uuid`/`fstype` identify the volume; the LV is activated via the
+/// `rd.lvm.lv=<vg>/<lv>` karg emitted by `get_kernel_options`.
+fn prepare_stateroot_var_include(uuid: &str, fstype: &str) -> Result<tempfile::TempDir> {
+    let tmp = tempfile::Builder::new()
+        .prefix("bootc-statevar-")
+        .tempdir_in("/var/tmp")
+        .context("failed to create scratch dir for stateroot var unit")?;
+    let unit_dir = tmp.path().join("etc/systemd/system");
+    fs::create_dir_all(&unit_dir)?;
+    // Mount path /sysroot/state/os/default/var → unit sysroot-state-os-default-var.mount
+    let unit_name = "sysroot-state-os-default-var.mount";
+    fs::write(
+        unit_dir.join(unit_name),
+        format!(
+            "[Unit]\n\
+             Description=Dedicated /var volume (composefs stateroot)\n\
+             After=sysroot.mount\n\
+             Before=initrd-root-fs.target bootc-root-setup.service\n\
+             DefaultDependencies=no\n\
+             \n\
+             [Mount]\n\
+             What=/dev/disk/by-uuid/{uuid}\n\
+             Where=/sysroot/state/os/default/var\n\
+             Type={fstype}\n\
+             Options=defaults\n\
+             \n\
+             [Install]\n\
+             WantedBy=initrd-root-fs.target\n"
+        ),
+    )?;
+    let wants_dir = unit_dir.join("initrd-root-fs.target.wants");
+    fs::create_dir_all(&wants_dir)?;
+    std::os::unix::fs::symlink(format!("../{unit_name}"), wants_dir.join(unit_name))
+        .context("failed to enable sysroot-state-os-default-var.mount")?;
+    let dropin_dir = unit_dir.join("bootc-root-setup.service.d");
+    fs::create_dir_all(&dropin_dir)?;
+    fs::write(
+        dropin_dir.join("RequiresStaterootVar.conf"),
+        format!("[Unit]\nRequires={unit_name}\nAfter={unit_name}\n"),
+    )?;
+    Ok(tmp)
+}
+
 fn rebuild_initrd_with_lvm_if_needed(
     kver: &str,
     mount_path: &Path,
@@ -312,15 +412,29 @@ fn rebuild_initrd_with_lvm_if_needed(
     // handles dm/crypt and composefs; for XFS it just lacks the xfs driver.
     let needs_dm = detect_lvm();
     let needs_xfs = Path::new("/sysroot/composefs-loopback.ext4").exists();
-    if !needs_dm && !needs_xfs {
+    // A dedicated /var volume needs a mount unit injected so bootc's composefs
+    // boot exposes its data at /var (see prepare_stateroot_var_include).
+    let separate_var = detect_separate_var();
+    if !needs_dm && !needs_xfs && separate_var.is_none() {
         return Ok(());
     }
-    let label = match (needs_dm, needs_xfs) {
-        (true, true) => "LVM/DM/crypt + XFS",
-        (true, false) => "LVM/DM/crypt",
-        _ => "XFS",
-    };
+    let mut features: Vec<&str> = Vec::new();
+    if needs_dm {
+        features.push("LVM/DM/crypt");
+    }
+    if needs_xfs {
+        features.push("XFS");
+    }
+    if separate_var.is_some() {
+        features.push("dedicated /var");
+    }
+    let label = features.join(" + ");
     println!("[phase5] Rebuilding composefs initrd with {label} support...");
+    if let Some((ref uuid, ref fstype)) = separate_var {
+        println!(
+            "[phase5] dedicated /var detected ({fstype}, UUID={uuid}) — will mount it at the composefs stateroot var path"
+        );
+    }
 
     // Source the target's kernel modules from the sealed composefs overlay mount
     // (real bytes, no network), falling back to registry streaming if they're
@@ -375,6 +489,10 @@ fn rebuild_initrd_with_lvm_if_needed(
     } else {
         None
     };
+    let var_include = match separate_var {
+        Some((ref uuid, ref fstype)) => Some(prepare_stateroot_var_include(uuid, fstype)?),
+        None => None,
+    };
 
     let mut bound = false;
     let run_rebuild = |bound: &mut bool| -> Result<std::process::ExitStatus> {
@@ -423,6 +541,12 @@ fn rebuild_initrd_with_lvm_if_needed(
             if let Some(ref inc) = loop_include {
                 cmd.arg("--include").arg(inc.path()).arg("/");
             }
+        }
+        if let Some(ref inc) = var_include {
+            // Ensure xfs/ext4 are present even when there's no composefs loopback
+            // (the dedicated /var may be the only reason we rebuild).
+            cmd.arg("--add-drivers").arg("xfs ext4");
+            cmd.arg("--include").arg(inc.path()).arg("/");
         }
         cmd.status().context("failed to run dracut --rebuild")
     };
