@@ -26,8 +26,17 @@ old OSTree deployment stays in the boot menu as a fallback the whole time.
 > storage, and user accounts — but treat it as risky until you've rebooted and
 > confirmed everything works. It's reversible until you run `commit` (step 5).
 
-**1. Get the migrator.** Build it (needs Rust; prebuilt binaries will land on the
-[Releases](../../releases) page):
+**1. Get the migrator.** Download the latest prebuilt binary (x86_64; for arm64
+swap in `aarch64-unknown-linux-gnu`):
+
+```bash
+curl -fsSL -o bmc.tar.gz \
+  https://github.com/hanthor/ostree-composefs-rebase/releases/latest/download/bootc-migrate-composefs-x86_64-unknown-linux-gnu.tar.gz
+tar xzf bmc.tar.gz
+sudo install -m755 bootc-migrate-composefs /usr/local/bin/
+```
+
+<details><summary>…or build from source (needs Rust)</summary>
 
 ```bash
 git clone https://github.com/hanthor/ostree-composefs-rebase
@@ -35,6 +44,7 @@ cd ostree-composefs-rebase
 cargo build --release
 sudo install -m755 target/release/bootc-migrate-composefs /usr/local/bin/
 ```
+</details>
 
 **2. Dry-run** — makes no changes, just checks your system is ready:
 
