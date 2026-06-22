@@ -36,6 +36,11 @@ jobs:
             target: ghcr.io/projectbluefin/dakota:stable
             filesystem: xfs+crypt
             disk_size: 40G
+          - name: bluefin LTS -> dakota (LVM-on-LUKS, separate /var + composefs)
+            base: ghcr.io/projectbluefin/bluefin:lts
+            target: ghcr.io/projectbluefin/dakota:stable
+            filesystem: xfs+lvm+crypt
+            disk_size: 40G
           # fedora-bootc self-migration is the simpler sanity case; revisit once
           # the bluefin scenario is green end-to-end.
           # - name: fedora-bootc self-migration
@@ -70,6 +75,7 @@ jobs:
             iproute2 \
             netcat-openbsd \
             cryptsetup \
+            lvm2 \
             xfsprogs \
             dosfstools \
             swtpm \
