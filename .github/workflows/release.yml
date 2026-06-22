@@ -46,6 +46,8 @@ jobs:
         with:
           bin: bootc-migrate-composefs
           target: ${{ matrix.target }}
-          archive: $bin-$tag-$target
+          # No $tag in the archive name so the README's
+          # releases/latest/download/<name> URL is stable across versions.
+          archive: $bin-$target
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}

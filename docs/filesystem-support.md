@@ -133,6 +133,62 @@ from the OSTree fallback entry.
 
 ---
 
+## Dedicated `/var` volume (separate partition or LV)
+
+Anaconda's default partitioning — and many real-world installs — put `/var` on
+its **own filesystem** (a separate partition or LVM logical volume), mounted via
+an `/etc/fstab` entry, distinct from the root volume. This is orthogonal to
+btrfs-vs-XFS: it can occur on either.
+
+### The problem
+
+bootc's composefs boot bind-mounts the **per-stateroot var**
+(`/sysroot/state/os/default/var`, which lives on the root filesystem) onto `/var`
+and **ignores the `/var` fstab entry entirely**. (Traditional OSTree does the
+opposite — the fstab `var.mount` overmounts the stateroot bind, so the dedicated
+volume wins.) On a composefs boot this means a dedicated `/var` volume is left
+unmounted and `/var` silently falls back to the empty stateroot var — losing the
+user's home directories, flatpaks, container storage, Tailscale state, etc. The
+data is safe (the volume is untouched), but the system boots unusable.
+
+Two things are needed to fix this, both handled automatically:
+
+### 1. Activate every LV backing a mounted filesystem
+
+The source OSTree cmdline typically lists only the root LV
+(`rd.lvm.lv=<vg>/root`); non-root volumes like a dedicated `/var` auto-activate
+post-switchroot on the source distro, so they never appear on the cmdline. The
+composefs target may lack that auto-activation path.
+
+`get_kernel_options` discovers every LV currently backing a mount
+(`findmnt` → `lvs`) and emits `rd.lvm.lv=<vg>/<lv>` for each, so the initrd
+activates them before their mounts run.
+
+### 2. Mount the dedicated `/var` at the stateroot var path
+
+Activation alone isn't enough, because bootc still binds the stateroot var onto
+`/var` and ignores fstab. `phase5_setup_bootloader` therefore:
+
+1. **`detect_separate_var()`** — uses `findmnt -o SOURCE,FSTYPE,FSROOT /var`; a
+   dedicated volume has `FSROOT == "/"` (a whole filesystem), versus a subtree
+   bind (btrfs `subvol=` or the ostree `…/var` bind) whose FSROOT is a subpath.
+   Returns the volume's `(uuid, fstype)`.
+
+2. **`prepare_stateroot_var_include(uuid, fstype)`** — injects a
+   `sysroot-state-os-default-var.mount` unit into the rebuilt initrd (via
+   `dracut --include`, mirroring the composefs loopback mount). It mounts the
+   dedicated volume at `/sysroot/state/os/default/var`, ordered
+   `After=sysroot.mount Before=bootc-root-setup.service`.
+
+`bootc-root-setup` then binds **that path** (now the real `/var` volume) onto
+`/var`, so the user's data appears at `/var` as expected.
+
+This path is exercised by the `xfs+lvm+crypt` e2e scenario (LVM-on-LUKS with
+separate `root` + `var` LVs); its `/var`-persistence assertions verify the
+dedicated volume's data survives the migration.
+
+---
+
 ## Re-running after a failed composefs boot
 
 If the first migration attempt produced a non-LVM initrd and the system is now stuck
@@ -163,3 +219,6 @@ bootc-migrate-composefs \
 | LVM root                  | uncommon                   | typical (Bluefin LTS default)    |
 | initrd rebuild needed     | no                         | yes — dracut --add "lvm dm"      |
 | dracut on source system   | not present                | present (CentOS Stream 10 base)  |
+
+Dedicated `/var` (separate partition/LV) is handled independently of the root
+filesystem type — see [Dedicated `/var` volume](#dedicated-var-volume-separate-partition-or-lv).

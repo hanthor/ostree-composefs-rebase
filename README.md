@@ -16,6 +16,70 @@ flatpaks, container storage, or user accounts.
 > Don't point this at a production machine you can't reinstall, but the core
 > path is stable.
 
+## Migrate Bluefin → Dakota (quick start)
+
+The common case: **Bluefin stable (btrfs) → Dakota stable**. Five steps. Your
+old OSTree deployment stays in the boot menu as a fallback the whole time.
+
+> ⚠️ **Back up anything you can't afford to lose first.** This rewrites how your
+> system boots. It preserves `/home`, `/var`, `/etc`, flatpaks, container
+> storage, and user accounts — but treat it as risky until you've rebooted and
+> confirmed everything works. It's reversible until you run `commit` (step 5).
+
+**1. Get the migrator.** Download the latest prebuilt binary (x86_64; for arm64
+swap in `aarch64-unknown-linux-gnu`):
+
+```bash
+curl -fsSL -o bmc.tar.gz \
+  https://github.com/hanthor/ostree-composefs-rebase/releases/latest/download/bootc-migrate-composefs-x86_64-unknown-linux-gnu.tar.gz
+tar xzf bmc.tar.gz
+sudo install -m755 bootc-migrate-composefs /usr/local/bin/
+```
+
+<details><summary>…or build from source (needs Rust)</summary>
+
+```bash
+git clone https://github.com/hanthor/ostree-composefs-rebase
+cd ostree-composefs-rebase
+cargo build --release
+sudo install -m755 target/release/bootc-migrate-composefs /usr/local/bin/
+```
+</details>
+
+**2. Dry-run** — makes no changes, just checks your system is ready:
+
+```bash
+sudo bootc-migrate-composefs \
+  --target-image ghcr.io/projectbluefin/dakota:stable --dry-run
+```
+
+**3. Migrate** (~5–25 min depending on cache/network):
+
+```bash
+sudo bootc-migrate-composefs \
+  --target-image ghcr.io/projectbluefin/dakota:stable
+```
+
+**4. Reboot** — the new composefs entry is the default. If anything looks wrong,
+pick the old **Bluefin / OSTree** entry in the boot menu to get straight back.
+
+```bash
+sudo systemctl reboot
+```
+
+**5. Confirm, then make it permanent:**
+
+```bash
+cat /proc/cmdline | grep -o 'composefs=[0-9a-f]*'   # confirms composefs boot
+sudo bootc-migrate-composefs commit                 # one-way; removes the OSTree fallback
+```
+
+That's it. For flags, rollback, troubleshooting, and the full phase-by-phase
+breakdown, see [Usage — end-to-end walkthrough](#usage--end-to-end-walkthrough).
+On **Bluefin LTS** (XFS) or systems with **LVM / LUKS / a dedicated `/var`
+partition**, the tool handles those automatically — see
+[docs/filesystem-support.md](docs/filesystem-support.md).
+
 ## Architecture
 
 ```mermaid

@@ -20,6 +20,19 @@ SSH_PORT="${SSH_PORT:-2222}"
 # from "ghcr.io/projectbluefin/dakota:stable"). Used by the subscription check.
 TARGET_REPO_TAG="${TARGET_REPO_TAG:-$(echo "$TARGET_IMAGE" | sed 's|.*/||')}"
 FILESYSTEM="${FILESYSTEM:-btrfs}"
+# Scenario capability flags derived from FILESYSTEM. Both encrypted scenarios
+# share all the LUKS plumbing (swtpm, serial passphrase injection, BLS karg
+# patching, skipping host-side SSH injection); the lvm variant additionally
+# carves a VG with separate root + /var logical volumes inside the LUKS
+# container, reproducing a dedicated-/var layout (e.g. anaconda's default).
+IS_LUKS=false
+IS_LVM=false
+case "$FILESYSTEM" in
+    xfs+crypt) IS_LUKS=true ;;
+    xfs+lvm+crypt) IS_LUKS=true; IS_LVM=true ;;
+esac
+# Volume group + logical volume names for the LVM scenario.
+LVM_VG="e2e_vg_${UUID_SUFFIX}"
 # Test variant: "migrate" (default — migrate, commit, rollback round-trip) or
 # "undo" (migrate, then verify `undo` cleans up and falls back to OSTree).
 E2E_TEST_MODE="${E2E_TEST_MODE:-migrate}"
@@ -220,7 +233,7 @@ echo "Using install image: $INSTALL_IMAGE"
 # 5. Create and initialize disk image (or restore checkpoint)
 # LUKS: checkpoint has plain partition layout, not LUKS — always full setup.
 CHECKPOINT="$WORKSPACE_DIR/disk.raw.pre-migration"
-if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+if [ "$IS_LUKS" = true ]; then
     echo "LUKS mode: skipping pre-migration checkpoint (needs fresh LUKS setup)"
     SKIP_SETUP=false
 elif [ -f "$CHECKPOINT" ]; then
@@ -283,6 +296,11 @@ cleanup() {
     if [ -n "${LOOP_DEV:-}" ]; then
         step "Detaching loopback device $LOOP_DEV..."
         sudo umount /tmp/mnt-e2e-disk 2>/dev/null || true
+        # Deactivate the LVM VG (if any) before closing the LUKS container that
+        # holds its PV, otherwise cryptsetup close fails with "device in use".
+        if [ "${IS_LVM:-false}" = true ]; then
+            sudo vgchange -an "$LVM_VG" 2>/dev/null || true
+        fi
         sudo cryptsetup close "$LUKS_MAPPER" 2>/dev/null || true
         sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
     fi
@@ -310,7 +328,7 @@ echo "Setting up loopback device..."
 LOOP_DEV=$(sudo losetup --show -f -P disk.raw)
 echo "Mounted loopback device: $LOOP_DEV"
 
-if [[ "$FILESYSTEM" == xfs+crypt ]]; then
+if [ "$IS_LUKS" = true ]; then
     # Install the GRUB-based source (Bluefin) with a LUKS-encrypted root, then
     # let the migration convert it to systemd-boot + composefs. We drive LUKS
     # ourselves and use `bootc install to-filesystem` (fisherman's process)
@@ -322,6 +340,13 @@ if [[ "$FILESYSTEM" == xfs+crypt ]]; then
     # root) + LUKS2 root. Unlock uses a keyfile on /boot for a deterministic,
     # non-interactive boot (production enrolls TPM2/PCR7 instead — see
     # docs/luks-testing.md).
+    #
+    # In the lvm variant the LUKS container holds an LVM PV/VG with *separate*
+    # root and /var logical volumes — reproducing a dedicated-/var layout
+    # (anaconda's default, e.g. kanpur). This is the case the migrator's
+    # rd.lvm.lv discovery must handle: the source GRUB entry activates only the
+    # root LV (rd.lvm.lv=<vg>/root) and relies on post-switchroot auto-activation
+    # for /var, so /proc/cmdline at migration time never mentions the var LV.
     echo "LUKS: partitioning (BIOS-boot + ESP + ext4 /boot + LUKS root)..."
     # GPT layout matching what `bootc install to-disk --generic-image` creates:
     # a 1 MiB BIOS boot partition (type 21686148-... = bios_grub) so grub2-install
@@ -350,6 +375,31 @@ SFDISK
         --key-file - "$ROOT_PART" "$LUKS_MAPPER"
     LUKS_UUID=$(sudo cryptsetup luksUUID "$ROOT_PART")
 
+    # Root and var device paths. Plain LUKS uses the mapper directly; the lvm
+    # variant carves a VG with separate root + var LVs inside the LUKS container.
+    ROOT_DEV="/dev/mapper/$LUKS_MAPPER"
+    VAR_DEV=""
+    lvm_root_arg=""
+    if [ "$IS_LVM" = true ]; then
+        echo "LVM: creating PV/VG ($LVM_VG) with separate root + var LVs inside LUKS..."
+        sudo pvcreate -ff -y "/dev/mapper/$LUKS_MAPPER"
+        sudo vgcreate "$LVM_VG" "/dev/mapper/$LUKS_MAPPER"
+        # /var only holds small test fixtures, so give it a fixed 4G and let root
+        # take the rest — the migration needs ample root space for the Dakota
+        # composefs object store + ext4 verity loopback (XFS path). Separate
+        # volumes is the whole point: /var lives on its own LV.
+        sudo lvcreate -y -L 4G -n var "$LVM_VG"
+        sudo lvcreate -y -l 100%FREE -n root "$LVM_VG"
+        sudo vgchange -ay "$LVM_VG"
+        sudo udevadm settle 2>/dev/null || true
+        ROOT_DEV="/dev/$LVM_VG/root"
+        VAR_DEV="/dev/$LVM_VG/var"
+        # Activate only root at boot via rd.lvm.lv — the var LV is intentionally
+        # left to auto-activation so it never appears on the source cmdline,
+        # faithfully reproducing the bug the migrator must fix.
+        lvm_root_arg="rd.lvm.lv=$LVM_VG/root"
+    fi
+
     echo "LUKS: making filesystems and mounting target..."
     # The host may lack a usable system mkfs.xfs (e.g. only a HOME-relative user
     # build that breaks under sudo). The install image ships real
@@ -357,13 +407,20 @@ SFDISK
     # --privileged + /dev exposes the loop partitions and the opened LUKS mapper.
     sudo podman run --privileged --rm -v /dev:/dev "$INSTALL_IMAGE" bash -c "
         set -e
-        mkfs.xfs -f /dev/mapper/$LUKS_MAPPER
+        mkfs.xfs -f $ROOT_DEV
+        ${VAR_DEV:+mkfs.xfs -f $VAR_DEV}
         mkfs.ext4 -F $BOOT_PART
         mkfs.vfat -F32 $ESP_PART"
     # Use /var/tmp (not /tmp, which is tmpfs on many hosts) as the mount point.
     INSTALL_ROOT=/var/tmp/mnt-e2e-install
     sudo mkdir -p "$INSTALL_ROOT"
-    sudo mount "/dev/mapper/$LUKS_MAPPER" "$INSTALL_ROOT"
+    sudo mount "$ROOT_DEV" "$INSTALL_ROOT"
+    if [ "$IS_LVM" = true ]; then
+        # Mount the dedicated /var LV under the target so bootc populates it and
+        # records it; an explicit fstab entry is added after install for certainty.
+        sudo mkdir -p "$INSTALL_ROOT/var"
+        sudo mount "$VAR_DEV" "$INSTALL_ROOT/var"
+    fi
     sudo mkdir -p "$INSTALL_ROOT/boot"
     sudo mount "$BOOT_PART" "$INSTALL_ROOT/boot"
     sudo mkdir -p "$INSTALL_ROOT/boot/efi"
@@ -400,8 +457,10 @@ SFDISK
     sudo mount -o remount,rw "$INSTALL_ROOT" 2>/dev/null || true
     # rd.luks.name=<UUID>=root maps the container to /dev/mapper/root, which
     # systemd-gpt-auto-generator needs to locate the encrypted root (the bare
-    # mapper-name form silently fails — projectbluefin/dakota#270).
-    luks_args="rd.luks.name=$LUKS_UUID=root"
+    # mapper-name form silently fails — projectbluefin/dakota#270). For the lvm
+    # variant we also activate the root LV (rd.lvm.lv=<vg>/root) — but NOT the
+    # var LV, mirroring the real-world source layout.
+    luks_args="rd.luks.name=$LUKS_UUID=root${lvm_root_arg:+ $lvm_root_arg}"
     for bls in "$INSTALL_ROOT"/boot/loader/entries/*.conf; do
         [ -f "$bls" ] || continue
         if ! grep -q 'rd.luks' "$bls"; then
@@ -410,8 +469,27 @@ SFDISK
         fi
     done
 
+    if [ "$IS_LVM" = true ]; then
+        echo "LVM: ensuring a /var fstab entry for the dedicated var LV..."
+        # The source (and the migrated system) must mount /var from the var LV.
+        # Add a UUID-based entry to the deployment's /etc/fstab if bootc didn't.
+        VAR_UUID=$(sudo blkid -o value -s UUID "$VAR_DEV")
+        for fstab in "$INSTALL_ROOT"/ostree/deploy/*/deploy/*/etc/fstab; do
+            [ -f "$fstab" ] || continue
+            if ! grep -qE '[[:space:]]/var[[:space:]]' "$fstab"; then
+                echo "UUID=$VAR_UUID /var xfs defaults 0 0" | sudo tee -a "$fstab" >/dev/null
+                echo "  added /var entry (UUID=$VAR_UUID) to $(basename "$(dirname "$fstab")")/etc/fstab"
+            fi
+        done
+    fi
+
     echo "LUKS: unmounting and closing..."
-    sudo umount "$INSTALL_ROOT/boot/efi" "$INSTALL_ROOT/boot" "$INSTALL_ROOT" 2>/dev/null || true
+    sudo umount "$INSTALL_ROOT/boot/efi" "$INSTALL_ROOT/boot" 2>/dev/null || true
+    [ "$IS_LVM" = true ] && sudo umount "$INSTALL_ROOT/var" 2>/dev/null || true
+    sudo umount "$INSTALL_ROOT" 2>/dev/null || true
+    if [ "$IS_LVM" = true ]; then
+        sudo vgchange -an "$LVM_VG" 2>/dev/null || true
+    fi
     sudo cryptsetup luksClose "$LUKS_MAPPER" 2>/dev/null || true
     SKIP_SETUP=true
     echo "LUKS disk setup complete (bootc install to-filesystem + keyfile, GRUB source)"
@@ -433,14 +511,14 @@ fi
 fi
 
 # Force kernel to reread partition table by detaching and re-attaching
-if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+if [ "$IS_LUKS" = true ]; then
     echo "LUKS mode: skipping loop cycle and SSH injection (root is encrypted)"
     # LUKS root is inaccessible from host; SSH key was injected by
     # bootc install to-disk --root-ssh-authorized-keys
     # Skip injection/fixtures/BLS steps: jump to OVMF setup
 fi
 
-if [ "$FILESYSTEM" != "xfs+crypt" ]; then
+if [ "$IS_LUKS" != true ]; then
     echo "Cycling loop device to refresh partitions..."
 fi
 sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
@@ -448,7 +526,7 @@ LOOP_DEV=$(sudo losetup --show -f -P disk.raw)
 echo "Re-attached loop device: $LOOP_DEV"
 
 # 5. Inject SSH keys and configuration (skip for LUKS — root is encrypted)
-if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+if [ "$IS_LUKS" = true ]; then
     echo "LUKS mode: SSH key already injected by bootc install, skipping host-side injection"
 else
 step "=== Injecting SSH credentials to disk image ==="
@@ -611,7 +689,7 @@ fi
 # QEMU command below) and SWTPM_PID (torn down in cleanup). Without this the
 # boot hangs at the LUKS prompt and the test times out.
 SWTPM_QEMU_ARGS=""
-if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+if [ "$IS_LUKS" = true ]; then
     if command -v swtpm >/dev/null 2>&1; then
         SWTPM_STATE_DIR=/tmp/swtpm-tpmstate
         SWTPM_SOCK=/tmp/swtpm-sock
@@ -637,7 +715,7 @@ fi
 # the serial console. `-nographic` wires the guest serial to QEMU's stdin, so we
 # feed it from a FIFO that a background watcher writes to when the prompt appears.
 QEMU_STDIN=/dev/null
-if [ "$FILESYSTEM" = "xfs+crypt" ]; then
+if [ "$IS_LUKS" = true ]; then
     PW_FIFO=/tmp/e2e-qemu-stdin
     rm -f "$PW_FIFO"
     mkfifo "$PW_FIFO"
@@ -905,6 +983,11 @@ echo '--- grub.cfg head ---'
 head -60 /boot/grub2/grub.cfg 2>/dev/null || echo 'no grub.cfg'
 echo '--- efibootmgr ---'
 efibootmgr -v 2>/dev/null || echo 'no efibootmgr'
+echo '--- (source, pre-reboot) /var device + seeded data ---'
+findmnt /var || echo '(no /var mount)'
+ls -la /var/lib/migration-test 2>&1 || echo '(no /var/lib/migration-test on source!)'
+echo '--- (source, pre-reboot) composefs deployment fstab ---'
+cat /sysroot/state/deploy/*/etc/fstab 2>/dev/null | grep -E '/var|^UUID' || echo '(no composefs deployment fstab /var entry)'
 DIAG
 
 step "=== Rebooting VM ==="
@@ -964,6 +1047,30 @@ if [ "$BOOTED_BACKEND" = "null" ]; then
     exit 1
 fi
 echo "OK: Booted backend is ComposeFS."
+
+# For the dedicated-/var-LV scenario, dump exactly where /var landed before the
+# persistence assertions run, so a failure pinpoints empty-LV vs shadowed-bind.
+if [ "$IS_LVM" = true ]; then
+    step "=== /var diagnostics (LVM scenario) ==="
+    ssh $SSH_OPTS root@localhost bash <<'VARDIAG' || true
+echo "--- findmnt /var ---"; findmnt /var || echo "(no /var mount)"
+echo "--- mounts touching /var ---"; mount | grep -E ' /var( |/)' || true
+echo "--- lsblk ---"; lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,UUID 2>/dev/null
+echo "--- lvs ---"; lvs 2>/dev/null || echo "(lvs unavailable)"
+echo "--- /etc/fstab ---"; cat /etc/fstab
+echo "--- ls /var/lib/migration-test ---"; ls -la /var/lib/migration-test 2>&1 || true
+echo "--- ls /var (top) ---"; ls -la /var | head -20
+echo "--- ostree stateroot var ---"; ls -la /sysroot/state/os/default/var 2>/dev/null | head
+echo "--- var LV content directly (mount it aside) ---"
+vardev=$(blkid -L "" 2>/dev/null; lvs --noheadings -o lv_dm_path 2>/dev/null | grep -i var | tr -d ' ')
+echo "var LV dm path: ${vardev:-unknown}"
+if [ -n "$vardev" ]; then
+    mkdir -p /tmp/varlv && mount -o ro "$vardev" /tmp/varlv 2>/dev/null \
+        && { echo "var LV contents:"; ls -la /tmp/varlv | head; ls -la /tmp/varlv/lib/migration-test 2>&1 || true; umount /tmp/varlv; } \
+        || echo "(could not mount var LV aside — likely already mounted at /var)"
+fi
+VARDIAG
+fi
 
 # Basic persistence
 TEST_DATA_VAL=$(ssh $SSH_OPTS root@localhost "cat /var/lib/migration-test/data")
