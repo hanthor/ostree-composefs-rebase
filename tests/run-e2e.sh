@@ -983,6 +983,11 @@ echo '--- grub.cfg head ---'
 head -60 /boot/grub2/grub.cfg 2>/dev/null || echo 'no grub.cfg'
 echo '--- efibootmgr ---'
 efibootmgr -v 2>/dev/null || echo 'no efibootmgr'
+echo '--- (source, pre-reboot) /var device + seeded data ---'
+findmnt /var || echo '(no /var mount)'
+ls -la /var/lib/migration-test 2>&1 || echo '(no /var/lib/migration-test on source!)'
+echo '--- (source, pre-reboot) composefs deployment fstab ---'
+cat /sysroot/state/deploy/*/etc/fstab 2>/dev/null | grep -E '/var|^UUID' || echo '(no composefs deployment fstab /var entry)'
 DIAG
 
 step "=== Rebooting VM ==="
@@ -1042,6 +1047,30 @@ if [ "$BOOTED_BACKEND" = "null" ]; then
     exit 1
 fi
 echo "OK: Booted backend is ComposeFS."
+
+# For the dedicated-/var-LV scenario, dump exactly where /var landed before the
+# persistence assertions run, so a failure pinpoints empty-LV vs shadowed-bind.
+if [ "$IS_LVM" = true ]; then
+    step "=== /var diagnostics (LVM scenario) ==="
+    ssh $SSH_OPTS root@localhost bash <<'VARDIAG' || true
+echo "--- findmnt /var ---"; findmnt /var || echo "(no /var mount)"
+echo "--- mounts touching /var ---"; mount | grep -E ' /var( |/)' || true
+echo "--- lsblk ---"; lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,UUID 2>/dev/null
+echo "--- lvs ---"; lvs 2>/dev/null || echo "(lvs unavailable)"
+echo "--- /etc/fstab ---"; cat /etc/fstab
+echo "--- ls /var/lib/migration-test ---"; ls -la /var/lib/migration-test 2>&1 || true
+echo "--- ls /var (top) ---"; ls -la /var | head -20
+echo "--- ostree stateroot var ---"; ls -la /sysroot/state/os/default/var 2>/dev/null | head
+echo "--- var LV content directly (mount it aside) ---"
+vardev=$(blkid -L "" 2>/dev/null; lvs --noheadings -o lv_dm_path 2>/dev/null | grep -i var | tr -d ' ')
+echo "var LV dm path: ${vardev:-unknown}"
+if [ -n "$vardev" ]; then
+    mkdir -p /tmp/varlv && mount -o ro "$vardev" /tmp/varlv 2>/dev/null \
+        && { echo "var LV contents:"; ls -la /tmp/varlv | head; ls -la /tmp/varlv/lib/migration-test 2>&1 || true; umount /tmp/varlv; } \
+        || echo "(could not mount var LV aside — likely already mounted at /var)"
+fi
+VARDIAG
+fi
 
 # Basic persistence
 TEST_DATA_VAL=$(ssh $SSH_OPTS root@localhost "cat /var/lib/migration-test/data")
