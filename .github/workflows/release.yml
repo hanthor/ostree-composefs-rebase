@@ -1,9 +1,12 @@
 # Publish release binaries when a v* tag is pushed.
 #
-#   git tag -a v0.1.0 -m 'Release 0.1.0' && git push origin v0.1.0
+#   git tag -a v0.1.2 -m 'Release 0.1.2' && git push origin v0.1.2
 #
-# Builds an optimized binary per target and attaches it (plus a SHA-256
-# checksum) to the GitHub Release for the tag.
+# Builds an optimized binary per target on a NATIVE runner (no cross), then a
+# single release job attaches all binaries (plus SHA-256 checksums) to the
+# GitHub Release in one atomic `gh release create` — required because this
+# account enforces immutable releases (assets must be present at creation;
+# you cannot upload to a release after it is published).
 name: Release
 
 on:
@@ -18,15 +21,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  upload-binaries:
-    name: Build + upload (${{ matrix.target }})
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,16 +43,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # Builds in release mode, names the archive, generates a checksum, and
-      # uploads it to the Release for the tag. Cross-compiles the non-native
-      # target via `cross` automatically. On workflow_dispatch (no tag) it
-      # builds but skips the upload.
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - name: Build + package
+        run: |
+          set -euo pipefail
+          cargo build --release --target ${{ matrix.target }}
+          name="bootc-migrate-composefs-${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/bootc-migrate-composefs" "$name-bin"
+          tar -C target/${{ matrix.target }}/release -czf "dist/$name.tar.gz" bootc-migrate-composefs
+          sha256sum "dist/$name.tar.gz" | awk '{print $1}' > "dist/$name.sha256"
+      - uses: actions/upload-artifact@v4
         with:
-          bin: bootc-migrate-composefs
-          target: ${{ matrix.target }}
-          # No $tag in the archive name so the README's
-          # releases/latest/download/<name> URL is stable across versions.
-          archive: $bin-$target
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: dist-${{ matrix.target }}
+          path: dist/
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish on a tag push; workflow_dispatch builds without releasing.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - name: Create release with all assets (atomic — immutable-safe)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
